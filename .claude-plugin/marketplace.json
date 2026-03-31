@@ -1,18 +1,18 @@
 {
-  "name": "indian-algo-trading",
+  "name": "rupeezy",
   "owner": {
     "name": "Rupeezy"
   },
   "metadata": {
     "description": "Write production-quality Python algo trading strategies for Indian markets (NSE, BSE, MCX). AI skill with 16 reference files + Rupeezy MCP servers for live trading, strategy deployment, backtesting, and portfolio management.",
     "version": "1.1.4",
-    "pluginRoot": "."
+    "pluginRoot": "./plugins/indian-algo-trading"
   },
   "plugins": [
     {
       "name": "indian-algo-trading",
-      "source": ".",
-      "description": "Write production-quality Python algo trading strategies for Indian markets (NSE, BSE, MCX). Includes broker adapter references, risk management, options Greeks, backtesting, and more.",
+      "source": "./plugins/indian-algo-trading",
+      "description": "Write production-quality Python algo trading strategies for Indian markets. Full suite: AI skill + Rupeezy MCP servers for live trading, strategy deployment, backtesting, and portfolio management.",
       "version": "1.1.4",
       "keywords": [
         "algo-trading",

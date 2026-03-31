@@ -1,7 +1,8 @@
 SKILL_NAME := indian-algo-trading
 VERSION := $(shell git describe --tags --abbrev=0 2>/dev/null || echo "dev")
 BUILD_DIR := build
-SKILL_DIR := skills/$(SKILL_NAME)
+PLUGIN_DIR := plugins/$(SKILL_NAME)
+SKILL_DIR := $(PLUGIN_DIR)/skills/$(SKILL_NAME)
 SKILL_FILE := $(BUILD_DIR)/$(SKILL_NAME)-$(VERSION).skill
 PLUGIN_FILE := $(BUILD_DIR)/$(SKILL_NAME)-$(VERSION).plugin
 
@@ -12,9 +13,9 @@ SKILL_FILES := $(SKILL_DIR)/SKILL.md \
 	$(SKILL_DIR)/scripts/validate_strategy.py \
 	$(SKILL_DIR)/scripts/scaffold_strategy.py
 
-# Plugin manifest + MCP (lives at repo root)
+# Plugin manifest + MCP (lives under plugins/indian-algo-trading/)
 # marketplace.json stays in repo (for GitHub marketplace sync) but NOT in .plugin zip
-PLUGIN_EXTRA := .claude-plugin/plugin.json .mcp.json
+PLUGIN_EXTRA := $(PLUGIN_DIR)/.claude-plugin/plugin.json $(PLUGIN_DIR)/.mcp.json
 
 .PHONY: skill plugin all clean list validate test-scaffold release
 
@@ -31,7 +32,7 @@ skill: $(SKILL_FILE)
 $(SKILL_FILE): $(SKILL_FILES)
 	@mkdir -p $(BUILD_DIR)
 	@rm -f $(SKILL_FILE)
-	@cd $(SKILL_DIR) && zip -r ../../$(SKILL_FILE) .
+	@cd $(SKILL_DIR) && zip -r $(CURDIR)/$(SKILL_FILE) .
 
 # --- Plugin package (skill + MCP servers + manifest) ---
 # The repo IS the plugin layout, so we cherry-pick what goes in
@@ -53,8 +54,8 @@ $(PLUGIN_FILE): $(SKILL_FILES) $(PLUGIN_EXTRA)
 	cp $(SKILL_DIR)/references/*.md $(BUILD_DIR)/plugin-staging/skills/$(SKILL_NAME)/references/
 	cp $(SKILL_DIR)/references/brokers/*.md $(BUILD_DIR)/plugin-staging/skills/$(SKILL_NAME)/references/brokers/
 	# Copy plugin manifest + MCP
-	cp .claude-plugin/plugin.json $(BUILD_DIR)/plugin-staging/.claude-plugin/
-	cp .mcp.json $(BUILD_DIR)/plugin-staging/
+	cp $(PLUGIN_DIR)/.claude-plugin/plugin.json $(BUILD_DIR)/plugin-staging/.claude-plugin/
+	cp $(PLUGIN_DIR)/.mcp.json $(BUILD_DIR)/plugin-staging/
 	@cd $(BUILD_DIR)/plugin-staging && zip -r ../../$(PLUGIN_FILE) .
 	@rm -rf $(BUILD_DIR)/plugin-staging
 
@@ -78,8 +79,8 @@ validate:
 	@grep -q "^description:" $(SKILL_DIR)/SKILL.md && echo "PASS: description field present" || echo "FAIL: Missing description field"
 	@echo ""
 	@echo "Validating plugin manifest..."
-	@python3 -m json.tool .claude-plugin/plugin.json > /dev/null 2>&1 && echo "PASS: plugin.json valid JSON" || echo "FAIL: plugin.json invalid"
-	@python3 -m json.tool .mcp.json > /dev/null 2>&1 && echo "PASS: .mcp.json valid JSON" || echo "FAIL: .mcp.json invalid"
+	@python3 -m json.tool $(PLUGIN_DIR)/.claude-plugin/plugin.json > /dev/null 2>&1 && echo "PASS: plugin.json valid JSON" || echo "FAIL: plugin.json invalid"
+	@python3 -m json.tool $(PLUGIN_DIR)/.mcp.json > /dev/null 2>&1 && echo "PASS: .mcp.json valid JSON" || echo "FAIL: .mcp.json invalid"
 	@python3 -m json.tool .claude-plugin/marketplace.json > /dev/null 2>&1 && echo "PASS: marketplace.json valid JSON" || echo "FAIL: marketplace.json invalid"
 
 test-scaffold:
