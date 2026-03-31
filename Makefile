@@ -13,7 +13,7 @@ SKILL_FILES := SKILL.md \
 	scripts/scaffold_strategy.py
 
 # Plugin adds MCP configs + plugin manifest on top of skill files
-PLUGIN_EXTRA := .claude-plugin/plugin.json .mcp.json
+PLUGIN_EXTRA := .claude-plugin/plugin.json .claude-plugin/marketplace.json .mcp.json
 
 .PHONY: skill plugin all clean list validate test-scaffold release
 
@@ -52,6 +52,7 @@ $(PLUGIN_FILE): $(SKILL_FILES) $(PLUGIN_EXTRA)
 	@mkdir -p $(BUILD_DIR)/$(SKILL_NAME)/skills/$(SKILL_NAME)/references/brokers
 	@mkdir -p $(BUILD_DIR)/$(SKILL_NAME)/skills/$(SKILL_NAME)/scripts
 	cp .claude-plugin/plugin.json $(BUILD_DIR)/$(SKILL_NAME)/.claude-plugin/
+	cp .claude-plugin/marketplace.json $(BUILD_DIR)/$(SKILL_NAME)/.claude-plugin/
 	cp .mcp.json $(BUILD_DIR)/$(SKILL_NAME)/
 	cp SKILL.md $(BUILD_DIR)/$(SKILL_NAME)/skills/$(SKILL_NAME)/
 	cp references/*.md $(BUILD_DIR)/$(SKILL_NAME)/skills/$(SKILL_NAME)/references/
@@ -91,6 +92,7 @@ validate:
 	@echo "Validating plugin manifest..."
 	@python3 -m json.tool .claude-plugin/plugin.json > /dev/null 2>&1 && echo "PASS: plugin.json valid JSON" || echo "FAIL: plugin.json invalid"
 	@python3 -m json.tool .mcp.json > /dev/null 2>&1 && echo "PASS: .mcp.json valid JSON" || echo "FAIL: .mcp.json invalid"
+	@python3 -m json.tool .claude-plugin/marketplace.json > /dev/null 2>&1 && echo "PASS: marketplace.json valid JSON" || echo "FAIL: marketplace.json invalid"
 
 test-scaffold:
 	@echo "Testing scaffold script..."
