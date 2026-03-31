@@ -14,7 +14,7 @@ description: >
   Vortex API, vortex-api, or asks about F&O strategy automation, options selling bot,
   intraday strategy, or positional strategy. Even if the user just says "write a strategy"
   or "help me automate my trading" — use this skill.
-version: 1.1.3
+version: 1.1.4
 ---
 
 # Indian Algo Trading — Strategy Writing Skill
@@ -51,29 +51,29 @@ Before writing a single line of code, discuss:
 
 Based on what the user needs, read the appropriate reference files:
 
-| User's Need | Reference File |
-|-------------|---------------|
-| Writing a new strategy | `references/strategy-patterns.md` |
-| Risk management / position sizing | `references/risk-management.md` |
-| Backtesting a strategy | `references/backtesting.md` |
-| Indian market rules (expiry, timings, margins) | `references/indian-market.md` |
-| Production error handling | `references/error-handling.md` |
-| Code quality / testing / logging | `references/code-quality.md` |
-| Rupeezy/Vortex API specifics | `references/brokers/rupeezy-vortex.md` |
+| User's Need                                    | Reference File                         |
+| ---------------------------------------------- | -------------------------------------- |
+| Writing a new strategy                         | `references/strategy-patterns.md`      |
+| Risk management / position sizing              | `references/risk-management.md`        |
+| Backtesting a strategy                         | `references/backtesting.md`            |
+| Indian market rules (expiry, timings, margins) | `references/indian-market.md`          |
+| Production error handling                      | `references/error-handling.md`         |
+| Code quality / testing / logging               | `references/code-quality.md`           |
+| Rupeezy/Vortex API specifics                   | `references/brokers/rupeezy-vortex.md` |
 
 **Advanced modules — suggest proactively when the context calls for it:**
 
-| Context | Reference File |
-|---------|---------------|
-| F&O / options strategy | `references/options-greeks.md` |
-| "When should I run this strategy?" | `references/regime-detection.md` |
-| Using FII/DII/OI data | `references/india-data-edge.md` |
-| Executing large orders | `references/execution-alpha.md` |
-| "Is my backtest reliable?" | `references/robustness-testing.md` |
-| Running multiple strategies | `references/portfolio-construction.md` |
-| Preventing emotional overrides | `references/psychological-guardrails.md` |
-| Tax efficiency | `references/tax-optimization.md` |
-| Performance / speed issues | `references/python-performance.md` |
+| Context                            | Reference File                           |
+| ---------------------------------- | ---------------------------------------- |
+| F&O / options strategy             | `references/options-greeks.md`           |
+| "When should I run this strategy?" | `references/regime-detection.md`         |
+| Using FII/DII/OI data              | `references/india-data-edge.md`          |
+| Executing large orders             | `references/execution-alpha.md`          |
+| "Is my backtest reliable?"         | `references/robustness-testing.md`       |
+| Running multiple strategies        | `references/portfolio-construction.md`   |
+| Preventing emotional overrides     | `references/psychological-guardrails.md` |
+| Tax efficiency                     | `references/tax-optimization.md`         |
+| Performance / speed issues         | `references/python-performance.md`       |
 
 Do not wait for the user to ask for advanced modules. If someone asks for a moving average
 strategy, generate it, then suggest: "This would benefit from regime detection to avoid
@@ -98,6 +98,7 @@ config.py        → All configurable parameters (no hardcoded values)
 ```
 
 Signal generation and execution are ALWAYS in separate modules. This allows:
+
 - Testing signals independently of execution
 - Swapping execution between backtest and live without changing signal logic
 - Reviewing signal quality without wading through order management code
@@ -105,6 +106,7 @@ Signal generation and execution are ALWAYS in separate modules. This allows:
 ### Configuration Externalized
 
 Every tunable parameter lives in `config.py` or environment variables:
+
 - Symbols, quantities, thresholds, indicator periods
 - Risk parameters (max loss, position size, drawdown limit)
 - Scheduling parameters (start time, end time, frequency)
@@ -149,7 +151,9 @@ platform can stop your strategy at any time.
 These are non-negotiable. Every strategy must follow them.
 
 ### 1. NEVER hardcode instrument tokens
+
 Tokens change daily. Always look them up from the instrument master by symbol.
+
 ```python
 # WRONG — will break tomorrow
 token = 2885
@@ -160,45 +164,56 @@ token = lookup_token(master, symbol="RELIANCE", exchange="NSE_EQ")
 ```
 
 ### 2. NEVER hardcode lot sizes
+
 Lot sizes change with corporate actions and SEBI directives. Look them up from the
 instrument master.
 
 ### 3. ALWAYS use stop-losses
+
 No strategy ships without a stop-loss. If the user explicitly asks for no stop-loss,
 warn them and add it anyway with a wide buffer. Document the risk.
 
 ### 4. ALWAYS check margin before placing orders
+
 Call the margin API before submitting. If insufficient, log it and skip — don't crash.
 
 ### 5. ALWAYS handle order rejections
+
 Orders get rejected (insufficient margin, price out of range, exchange down). Every
 `place_order` call must have error handling with try/except.
 
 ### 6. NEVER ignore partial fills
+
 Track fill state precisely. A "buy 100" order might fill 60 now and 40 later, or
 fill 60 and get cancelled for the rest. The strategy must handle this.
 
 ### 7. ALWAYS set IST timezone explicitly
+
 ```python
 import pytz
 IST = pytz.timezone("Asia/Kolkata")
 ```
+
 All time comparisons use IST. Never rely on system timezone.
 
 ### 8. Connect WebSocket BEFORE placing orders
+
 If you connect after placing an order, that order's status update is lost. Always
 connect WebSocket feed as the first step after authentication.
 
 ### 9. NEVER short sell illiquid equities intraday
+
 Short selling equities carries auction risk. If the stock hits upper circuit, you
 cannot exit and face penalties of 20%+ above your sell price. Check volume and circuit
 band before shorting. Prefer F&O for short positions. Read `references/indian-market.md`
 for full details on auction risk.
 
 ### 10. ALWAYS respect tick sizes
+
 Every instrument has a minimum tick size (from the instrument master's `tick` column).
 Order prices MUST be rounded to the nearest valid tick. Placing an order at ₹100.03
 when the tick size is ₹0.05 will get rejected.
+
 ```python
 # Round price to nearest tick
 def round_to_tick(price, tick_size):
@@ -208,13 +223,16 @@ def round_to_tick(price, tick_size):
 # round_to_tick(100.03, 0.05) → 100.05
 # round_to_tick(247.12, 0.05) → 247.10
 ```
+
 Look up tick size from the instrument master alongside the token. Never assume a
 tick size — it varies by instrument and exchange.
 
 ### 11. ALWAYS respect Daily Price Range (DPR)
+
 Exchanges set a daily price range (circuit limit band) for each instrument. Orders
 with prices outside this range are rejected by the broker's OMS before they even
 reach the exchange. This commonly trips up limit orders and stop-loss orders.
+
 - For limit orders: ensure price is within the DPR band
 - For stop-loss orders: ensure trigger price is within DPR
 - If placing orders far from current market price (e.g., deep stop-losses), check
@@ -222,11 +240,13 @@ reach the exchange. This commonly trips up limit orders and stop-loss orders.
 - DPR information is available from the broker's quote/market data
 
 ### 12. Account for calendar spread margin removal on expiry day
+
 On expiry day, calendar spread margin benefits are removed. Margin can jump 5-10x
 (e.g., ₹26K → ₹2.6L per lot). Check if any spread leg expires today and ensure
 full margin is available. Read `references/risk-management.md` for details.
 
 ### 13. NSE does NOT provide a public data API
+
 NSE does not offer any direct data API for programmatic access. All market data
 (quotes, historical candles, order book) must come through your broker's API.
 Alternative data like FII/DII flows, OI, delivery percentages — if available — come
