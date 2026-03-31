@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.2] - 2026-03-31
+
+### Changed
+- Version bump for release alignment
+
+## [1.1.1] - 2026-03-31
+
+### Added
+- `marketplace.json` for plugin discoverability in marketplaces
+- Dual packaging: `.skill` (platform-agnostic) and `.plugin` (Claude + Rupeezy MCP)
+- `.mcp.json` bundling Rupeezy Trading and Strategy Platform MCP servers
+- Makefile with `skill`, `plugin`, `all`, `release`, `validate`, and `test-scaffold` targets
+- CONTRIBUTING_BROKER.md — step-by-step guide for adding broker adapters with AI prompt template
+- `validate_broker_adapter.py` — automated broker adapter validation script
+
+### Changed
+- Removed MCP tool docs from `rupeezy-vortex.md` (auto-discovered via `.mcp.json`)
+
 ## [1.0.0] - 2026-03-31
 
 ### Added
