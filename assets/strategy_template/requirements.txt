@@ -1,0 +1,9 @@
+vortex-api>=1.0.0
+pandas>=1.5.0
+numpy>=1.23.0
+pytz>=2023.3
+pytest>=7.3.0
+pytest-cov>=4.1.0
+black>=23.3.0
+flake8>=6.0.0
+mypy>=1.2.0

@@ -1,0 +1,410 @@
+{
+  "skill_name": "indian-algo-trading",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Write a simple moving average crossover strategy for RELIANCE on NSE with proper risk management",
+      "expected_output": "Strategy code that implements 50/200 MA crossover, includes tick size rounding, stop-loss logic, IST timezone handling, risk manager approval pattern, and instrument master lookup without hardcoded tokens",
+      "files": [],
+      "assertions": [
+        {
+          "name": "has-round-to-tick",
+          "type": "contains",
+          "value": "round_to_tick"
+        },
+        {
+          "name": "no-hardcoded-tokens",
+          "type": "not_contains",
+          "value": "token = "
+        },
+        {
+          "name": "has-stop-loss",
+          "type": "contains",
+          "value": "stop_loss"
+        },
+        {
+          "name": "has-ist-timezone",
+          "type": "contains",
+          "value": "Asia/Kolkata"
+        },
+        {
+          "name": "has-instrument-lookup",
+          "type": "contains",
+          "value": "download_master"
+        },
+        {
+          "name": "has-risk-manager",
+          "type": "contains",
+          "value": "risk"
+        },
+        {
+          "name": "no-nse-scraping",
+          "type": "not_contains",
+          "value": "nseindia.com"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Write a Nifty weekly options selling strategy using iron condors with proper margin and Greek calculations",
+      "expected_output": "Options strategy code that defines risk spreads (not naked), includes lot size from master, expiry awareness, Greek calculations (delta, theta, vega), margin checks, and proper error handling for illiquid strikes",
+      "files": [],
+      "assertions": [
+        {
+          "name": "has-lot-size-lookup",
+          "type": "contains",
+          "value": "lot_size"
+        },
+        {
+          "name": "has-spread-definition",
+          "type": "contains",
+          "value": "spread"
+        },
+        {
+          "name": "has-expiry-check",
+          "type": "contains",
+          "value": "expiry"
+        },
+        {
+          "name": "has-greek-calculation",
+          "type": "contains",
+          "value": "delta"
+        },
+        {
+          "name": "no-naked-selling",
+          "type": "not_contains",
+          "value": "naked"
+        },
+        {
+          "name": "has-margin-check",
+          "type": "contains",
+          "value": "margin"
+        },
+        {
+          "name": "uses-instrument-master",
+          "type": "contains",
+          "value": "download_master"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Backtest a momentum strategy on Nifty 50 stocks from 2022-2024 with realistic transaction costs",
+      "expected_output": "Backtest code using backtesting.py or vectorbt that includes realistic STT (0.025%), brokerage (0.03%), slippage (0.02%), proper data sourcing without NSE scraping, and comprehensive metrics (Sharpe, max drawdown, win rate)",
+      "files": [],
+      "assertions": [
+        {
+          "name": "uses-backtesting-library",
+          "type": "contains",
+          "value": "backtesting"
+        },
+        {
+          "name": "has-transaction-costs",
+          "type": "contains",
+          "value": "cost"
+        },
+        {
+          "name": "has-stt-calculation",
+          "type": "contains",
+          "value": "0.025"
+        },
+        {
+          "name": "includes-slippage",
+          "type": "contains",
+          "value": "slippage"
+        },
+        {
+          "name": "no-live-nse-scraping",
+          "type": "not_contains",
+          "value": "nseindia.com"
+        },
+        {
+          "name": "has-sharpe-ratio",
+          "type": "contains",
+          "value": "sharpe"
+        },
+        {
+          "name": "saves-results",
+          "type": "contains",
+          "value": "save_backtest_result"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "Write an intraday short selling strategy for small-cap stocks with proper auction risk management",
+      "expected_output": "Strategy code that includes auction risk warnings, 3:00 PM forced cover logic, pre-short circuit limit checks, borrow availability verification, and clear documentation of T+2 obligation risks",
+      "files": [],
+      "assertions": [
+        {
+          "name": "has-auction-warning",
+          "type": "contains",
+          "value": "auction"
+        },
+        {
+          "name": "has-three-pm-cover",
+          "type": "contains",
+          "value": "15:00"
+        },
+        {
+          "name": "has-short-circuit-check",
+          "type": "contains",
+          "value": "circuit"
+        },
+        {
+          "name": "has-borrow-check",
+          "type": "contains",
+          "value": "borrow"
+        },
+        {
+          "name": "has-intraday-logic",
+          "type": "contains",
+          "value": "INTRADAY"
+        },
+        {
+          "name": "has-risk-documentation",
+          "type": "contains",
+          "value": "risk"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "Deploy a live VWAP execution strategy on Rupeezy with WebSocket streaming and graceful shutdown handling",
+      "expected_output": "Live trading code using VortexAPI, WebSocket connections for real-time ticks, proper authentication/OAuth pattern, SIGTERM handler for graceful shutdown, error recovery, and monitoring/logging for production deployment",
+      "files": [],
+      "assertions": [
+        {
+          "name": "uses-vortex-api",
+          "type": "contains",
+          "value": "vortex"
+        },
+        {
+          "name": "uses-websocket",
+          "type": "contains",
+          "value": "websocket"
+        },
+        {
+          "name": "has-auth-handling",
+          "type": "contains",
+          "value": "auth"
+        },
+        {
+          "name": "has-sigterm-handler",
+          "type": "contains",
+          "value": "SIGTERM"
+        },
+        {
+          "name": "has-error-recovery",
+          "type": "contains",
+          "value": "except"
+        },
+        {
+          "name": "has-logging",
+          "type": "contains",
+          "value": "log"
+        },
+        {
+          "name": "has-vwap-calculation",
+          "type": "contains",
+          "value": "vwap"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "Write a limit order placement strategy that respects DPR and tick size rules when placing orders near support levels",
+      "expected_output": "Strategy code that uses round_to_tick() for all prices, validates DPR (Daily Price Range) before placement, includes support level identification, and includes order validation checks before placing",
+      "files": [],
+      "assertions": [
+        {
+          "name": "has-round-to-tick",
+          "type": "contains",
+          "value": "round_to_tick"
+        },
+        {
+          "name": "has-dpr-validation",
+          "type": "contains",
+          "value": "dpr"
+        },
+        {
+          "name": "has-support-detection",
+          "type": "contains",
+          "value": "support"
+        },
+        {
+          "name": "validates-before-placing",
+          "type": "contains",
+          "value": "place_order"
+        },
+        {
+          "name": "has-price-rounding",
+          "type": "contains",
+          "value": "round"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "prompt": "Write a Nifty calendar spread strategy that monitors expiry-day margin removal risks",
+      "expected_output": "Options strategy code that trades calendar spreads, includes warnings about index expiry margin removal (typically 2 days before expiry), monitors margin availability, includes exit logic for expiry week, and tracks position Greeks across expirations",
+      "files": [],
+      "assertions": [
+        {
+          "name": "has-calendar-spread",
+          "type": "contains",
+          "value": "spread"
+        },
+        {
+          "name": "has-expiry-warning",
+          "type": "contains",
+          "value": "expiry"
+        },
+        {
+          "name": "has-margin-monitoring",
+          "type": "contains",
+          "value": "margin"
+        },
+        {
+          "name": "has-exit-logic",
+          "type": "contains",
+          "value": "exit"
+        },
+        {
+          "name": "tracks-multiple-expirations",
+          "type": "contains",
+          "value": "expir"
+        },
+        {
+          "name": "uses-instrument-master",
+          "type": "contains",
+          "value": "download_master"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "prompt": "Help me run 3 strategies simultaneously with portfolio-level risk management and correlation awareness",
+      "expected_output": "Multi-strategy framework that includes correlation-aware position sizing across strategies, portfolio heat limits (max loss, max notional), strategy decay detection, inter-strategy position offset tracking, and consolidated risk dashboard",
+      "files": [],
+      "assertions": [
+        {
+          "name": "has-correlation-calculation",
+          "type": "contains",
+          "value": "correlation"
+        },
+        {
+          "name": "has-portfolio-heat-limit",
+          "type": "contains",
+          "value": "portfolio"
+        },
+        {
+          "name": "has-risk-aggregation",
+          "type": "contains",
+          "value": "risk"
+        },
+        {
+          "name": "has-multiple-strategies",
+          "type": "contains",
+          "value": "strateg"
+        },
+        {
+          "name": "monitors-decay",
+          "type": "contains",
+          "value": "decay"
+        },
+        {
+          "name": "tracks-notional",
+          "type": "contains",
+          "value": "notional"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "prompt": "Get historical Nifty data and build a mean reversion strategy without scraping NSE directly",
+      "expected_output": "Strategy that sources historical data from broker API or licensed provider (not NSE scraping), includes mean reversion logic with Bollinger Bands or Z-score, proper lookback period validation, and realistic backtest results",
+      "files": [],
+      "assertions": [
+        {
+          "name": "no-nse-scraping",
+          "type": "not_contains",
+          "value": "nseindia.com"
+        },
+        {
+          "name": "uses-broker-api",
+          "type": "contains",
+          "value": "api"
+        },
+        {
+          "name": "has-mean-reversion-logic",
+          "type": "contains",
+          "value": "mean"
+        },
+        {
+          "name": "uses-bollinger-or-zscore",
+          "type": "contains",
+          "value": "bollinger"
+        },
+        {
+          "name": "validates-lookback",
+          "type": "contains",
+          "value": "lookback"
+        },
+        {
+          "name": "includes-backtest",
+          "type": "contains",
+          "value": "backtest"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "prompt": "I want to build, test, and deploy a pairs trading strategy on bank stocks with proper risk controls and walk-forward validation",
+      "expected_output": "Complete lifecycle code including: backtest with realistic costs on historical bank pairs data, walk-forward validation periods, paper trading phase simulation, live deployment with risk limits per pair, correlation decay detection, and cointegration monitoring",
+      "files": [],
+      "assertions": [
+        {
+          "name": "has-backtest-phase",
+          "type": "contains",
+          "value": "backtest"
+        },
+        {
+          "name": "has-walk-forward",
+          "type": "contains",
+          "value": "walk"
+        },
+        {
+          "name": "has-pairs-logic",
+          "type": "contains",
+          "value": "pair"
+        },
+        {
+          "name": "has-cointegration-check",
+          "type": "contains",
+          "value": "coint"
+        },
+        {
+          "name": "has-transaction-costs",
+          "type": "contains",
+          "value": "cost"
+        },
+        {
+          "name": "has-correlation-decay",
+          "type": "contains",
+          "value": "correlation"
+        },
+        {
+          "name": "has-live-risk-limits",
+          "type": "contains",
+          "value": "risk"
+        },
+        {
+          "name": "uses-instrument-master",
+          "type": "contains",
+          "value": "download_master"
+        }
+      ]
+    }
+  ]
+}
