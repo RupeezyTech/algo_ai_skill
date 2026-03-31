@@ -102,7 +102,9 @@ bump:
 	@echo "Done. Run 'make release' to build and publish."
 
 release: all
-	@test "$(VERSION)" != "dev" || (echo "Error: no git tag found. Run: git tag -a vX.Y.Z -m 'Release vX.Y.Z'" && exit 1)
+	@test "$(VERSION)" != "dev" || (echo "Error: no git tag found. Run: make bump NEW_VERSION=X.Y.Z" && exit 1)
+	git push origin main
+	git push origin $(VERSION)
 	gh release create $(VERSION) $(SKILL_FILE) $(PLUGIN_FILE) \
 		--title "$(SKILL_NAME) $(VERSION)" \
 		--notes-file CHANGELOG.md
