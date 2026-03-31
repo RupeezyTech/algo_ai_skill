@@ -13,7 +13,8 @@ SKILL_FILES := $(SKILL_DIR)/SKILL.md \
 	$(SKILL_DIR)/scripts/scaffold_strategy.py
 
 # Plugin manifest + MCP (lives at repo root)
-PLUGIN_EXTRA := .claude-plugin/plugin.json .claude-plugin/marketplace.json .mcp.json
+# marketplace.json stays in repo (for GitHub marketplace sync) but NOT in .plugin zip
+PLUGIN_EXTRA := .claude-plugin/plugin.json .mcp.json
 
 .PHONY: skill plugin all clean list validate test-scaffold release
 
@@ -29,6 +30,7 @@ skill: $(SKILL_FILE)
 
 $(SKILL_FILE): $(SKILL_FILES)
 	@mkdir -p $(BUILD_DIR)
+	@rm -f $(SKILL_FILE)
 	@cd $(SKILL_DIR) && zip -r ../../$(SKILL_FILE) .
 
 # --- Plugin package (skill + MCP servers + manifest) ---
@@ -41,14 +43,20 @@ plugin: $(PLUGIN_FILE)
 	@echo "Size:  $$(du -h $(PLUGIN_FILE) | cut -f1)"
 
 $(PLUGIN_FILE): $(SKILL_FILES) $(PLUGIN_EXTRA)
-	@mkdir -p $(BUILD_DIR)/$(SKILL_NAME)/.claude-plugin
-	@mkdir -p $(BUILD_DIR)/$(SKILL_NAME)/skills
-	cp -r $(SKILL_DIR) $(BUILD_DIR)/$(SKILL_NAME)/skills/
-	cp .claude-plugin/plugin.json $(BUILD_DIR)/$(SKILL_NAME)/.claude-plugin/
-	cp .claude-plugin/marketplace.json $(BUILD_DIR)/$(SKILL_NAME)/.claude-plugin/
-	cp .mcp.json $(BUILD_DIR)/$(SKILL_NAME)/
-	@cd $(BUILD_DIR) && zip -r ../$(PLUGIN_FILE) $(SKILL_NAME)/
-	@rm -rf $(BUILD_DIR)/$(SKILL_NAME)
+	@rm -f $(PLUGIN_FILE)
+	@rm -rf $(BUILD_DIR)/plugin-staging
+	@mkdir -p $(BUILD_DIR)/plugin-staging/.claude-plugin
+	@mkdir -p $(BUILD_DIR)/plugin-staging/skills/$(SKILL_NAME)/references/brokers
+	# Copy SKILL.md
+	cp $(SKILL_DIR)/SKILL.md $(BUILD_DIR)/plugin-staging/skills/$(SKILL_NAME)/
+	# Copy references (preserve brokers/ subdirectory so SKILL.md paths work)
+	cp $(SKILL_DIR)/references/*.md $(BUILD_DIR)/plugin-staging/skills/$(SKILL_NAME)/references/
+	cp $(SKILL_DIR)/references/brokers/*.md $(BUILD_DIR)/plugin-staging/skills/$(SKILL_NAME)/references/brokers/
+	# Copy plugin manifest + MCP
+	cp .claude-plugin/plugin.json $(BUILD_DIR)/plugin-staging/.claude-plugin/
+	cp .mcp.json $(BUILD_DIR)/plugin-staging/
+	@cd $(BUILD_DIR)/plugin-staging && zip -r ../../$(PLUGIN_FILE) .
+	@rm -rf $(BUILD_DIR)/plugin-staging
 
 # --- Utilities ---
 
