@@ -8,7 +8,9 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [1.1.2] - 2026-03-31
 
 ### Changed
-- Version bump for release alignment
+- Restructured repo to native plugin layout (skill files under `skills/indian-algo-trading/`)
+- Repo is now directly installable as a Cowork marketplace — no build step needed
+- Updated Makefile for new directory structure
 
 ## [1.1.1] - 2026-03-31
 

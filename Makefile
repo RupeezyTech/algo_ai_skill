@@ -1,18 +1,18 @@
 SKILL_NAME := indian-algo-trading
 VERSION := $(shell git describe --tags --abbrev=0 2>/dev/null || echo "dev")
 BUILD_DIR := build
+SKILL_DIR := skills/$(SKILL_NAME)
 SKILL_FILE := $(BUILD_DIR)/$(SKILL_NAME)-$(VERSION).skill
 PLUGIN_FILE := $(BUILD_DIR)/$(SKILL_NAME)-$(VERSION).plugin
 
-# Files that go into the skill package
-SKILL_FILES := SKILL.md \
-	$(wildcard references/*.md) \
-	$(wildcard references/brokers/rupeezy-vortex.md) \
-	$(wildcard references/brokers/BROKER_TEMPLATE.md) \
-	scripts/validate_strategy.py \
-	scripts/scaffold_strategy.py
+# Skill content (lives under skills/indian-algo-trading/)
+SKILL_FILES := $(SKILL_DIR)/SKILL.md \
+	$(wildcard $(SKILL_DIR)/references/*.md) \
+	$(wildcard $(SKILL_DIR)/references/brokers/*.md) \
+	$(SKILL_DIR)/scripts/validate_strategy.py \
+	$(SKILL_DIR)/scripts/scaffold_strategy.py
 
-# Plugin adds MCP configs + plugin manifest on top of skill files
+# Plugin manifest + MCP (lives at repo root)
 PLUGIN_EXTRA := .claude-plugin/plugin.json .claude-plugin/marketplace.json .mcp.json
 
 .PHONY: skill plugin all clean list validate test-scaffold release
@@ -28,18 +28,11 @@ skill: $(SKILL_FILE)
 	@echo "Size:  $$(du -h $(SKILL_FILE) | cut -f1)"
 
 $(SKILL_FILE): $(SKILL_FILES)
-	@mkdir -p $(BUILD_DIR)/$(SKILL_NAME)/references/brokers
-	@mkdir -p $(BUILD_DIR)/$(SKILL_NAME)/scripts
-	cp SKILL.md $(BUILD_DIR)/$(SKILL_NAME)/
-	cp references/*.md $(BUILD_DIR)/$(SKILL_NAME)/references/
-	cp references/brokers/rupeezy-vortex.md $(BUILD_DIR)/$(SKILL_NAME)/references/brokers/
-	cp references/brokers/BROKER_TEMPLATE.md $(BUILD_DIR)/$(SKILL_NAME)/references/brokers/
-	cp scripts/validate_strategy.py $(BUILD_DIR)/$(SKILL_NAME)/scripts/
-	cp scripts/scaffold_strategy.py $(BUILD_DIR)/$(SKILL_NAME)/scripts/
-	@cd $(BUILD_DIR) && zip -r ../$(SKILL_FILE) $(SKILL_NAME)/
-	@rm -rf $(BUILD_DIR)/$(SKILL_NAME)
+	@mkdir -p $(BUILD_DIR)
+	@cd $(SKILL_DIR) && zip -r ../../$(SKILL_FILE) .
 
-# --- Plugin package (skill + MCP servers) ---
+# --- Plugin package (skill + MCP servers + manifest) ---
+# The repo IS the plugin layout, so we cherry-pick what goes in
 
 plugin: $(PLUGIN_FILE)
 	@echo ""
@@ -49,17 +42,11 @@ plugin: $(PLUGIN_FILE)
 
 $(PLUGIN_FILE): $(SKILL_FILES) $(PLUGIN_EXTRA)
 	@mkdir -p $(BUILD_DIR)/$(SKILL_NAME)/.claude-plugin
-	@mkdir -p $(BUILD_DIR)/$(SKILL_NAME)/skills/$(SKILL_NAME)/references/brokers
-	@mkdir -p $(BUILD_DIR)/$(SKILL_NAME)/skills/$(SKILL_NAME)/scripts
+	@mkdir -p $(BUILD_DIR)/$(SKILL_NAME)/skills
+	cp -r $(SKILL_DIR) $(BUILD_DIR)/$(SKILL_NAME)/skills/
 	cp .claude-plugin/plugin.json $(BUILD_DIR)/$(SKILL_NAME)/.claude-plugin/
 	cp .claude-plugin/marketplace.json $(BUILD_DIR)/$(SKILL_NAME)/.claude-plugin/
 	cp .mcp.json $(BUILD_DIR)/$(SKILL_NAME)/
-	cp SKILL.md $(BUILD_DIR)/$(SKILL_NAME)/skills/$(SKILL_NAME)/
-	cp references/*.md $(BUILD_DIR)/$(SKILL_NAME)/skills/$(SKILL_NAME)/references/
-	cp references/brokers/rupeezy-vortex.md $(BUILD_DIR)/$(SKILL_NAME)/skills/$(SKILL_NAME)/references/brokers/
-	cp references/brokers/BROKER_TEMPLATE.md $(BUILD_DIR)/$(SKILL_NAME)/skills/$(SKILL_NAME)/references/brokers/
-	cp scripts/validate_strategy.py $(BUILD_DIR)/$(SKILL_NAME)/skills/$(SKILL_NAME)/scripts/
-	cp scripts/scaffold_strategy.py $(BUILD_DIR)/$(SKILL_NAME)/skills/$(SKILL_NAME)/scripts/
 	@cd $(BUILD_DIR) && zip -r ../$(PLUGIN_FILE) $(SKILL_NAME)/
 	@rm -rf $(BUILD_DIR)/$(SKILL_NAME)
 
@@ -75,19 +62,12 @@ list:
 	@echo "=== Plugin adds ==="
 	@echo ""
 	@for f in $(PLUGIN_EXTRA); do echo "  $$f"; done
-	@echo "  + skill nested under skills/$(SKILL_NAME)/"
 
 validate:
-	@echo "Validating strategy template..."
-	@python3 scripts/validate_strategy.py assets/strategy_template/strategy.py
-	@echo ""
-	@echo "Validating broker template..."
-	@python3 scripts/validate_broker_adapter.py references/brokers/BROKER_TEMPLATE.md
-	@echo ""
 	@echo "Validating SKILL.md frontmatter..."
-	@head -1 SKILL.md | grep -q "^---" && echo "PASS: YAML frontmatter present" || echo "FAIL: Missing YAML frontmatter"
-	@grep -q "^name:" SKILL.md && echo "PASS: name field present" || echo "FAIL: Missing name field"
-	@grep -q "^description:" SKILL.md && echo "PASS: description field present" || echo "FAIL: Missing description field"
+	@head -1 $(SKILL_DIR)/SKILL.md | grep -q "^---" && echo "PASS: YAML frontmatter present" || echo "FAIL: Missing YAML frontmatter"
+	@grep -q "^name:" $(SKILL_DIR)/SKILL.md && echo "PASS: name field present" || echo "FAIL: Missing name field"
+	@grep -q "^description:" $(SKILL_DIR)/SKILL.md && echo "PASS: description field present" || echo "FAIL: Missing description field"
 	@echo ""
 	@echo "Validating plugin manifest..."
 	@python3 -m json.tool .claude-plugin/plugin.json > /dev/null 2>&1 && echo "PASS: plugin.json valid JSON" || echo "FAIL: plugin.json invalid"
@@ -96,7 +76,7 @@ validate:
 
 test-scaffold:
 	@echo "Testing scaffold script..."
-	@cd /tmp && python3 $(CURDIR)/scripts/scaffold_strategy.py _makefile_test --type live > /dev/null 2>&1
+	@cd /tmp && python3 $(CURDIR)/$(SKILL_DIR)/scripts/scaffold_strategy.py _makefile_test --type live > /dev/null 2>&1
 	@test -f /tmp/_makefile_test/main.py && echo "PASS: scaffold generates files" || echo "FAIL: scaffold broken"
 	@rm -rf /tmp/_makefile_test
 
