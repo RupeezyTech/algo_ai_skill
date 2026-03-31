@@ -17,7 +17,7 @@ SKILL_FILES := $(SKILL_DIR)/SKILL.md \
 # marketplace.json stays in repo (for GitHub marketplace sync) but NOT in .plugin zip
 PLUGIN_EXTRA := $(PLUGIN_DIR)/.claude-plugin/plugin.json $(PLUGIN_DIR)/.mcp.json
 
-.PHONY: skill plugin all clean list validate test-scaffold release
+.PHONY: skill plugin all clean list validate test-scaffold bump release
 
 all: skill plugin
 
@@ -88,6 +88,18 @@ test-scaffold:
 	@cd /tmp && python3 $(CURDIR)/$(SKILL_DIR)/scripts/scaffold_strategy.py _makefile_test --type live > /dev/null 2>&1
 	@test -f /tmp/_makefile_test/main.py && echo "PASS: scaffold generates files" || echo "FAIL: scaffold broken"
 	@rm -rf /tmp/_makefile_test
+
+bump:
+	@test -n "$(NEW_VERSION)" || (echo "Usage: make bump NEW_VERSION=1.2.0" && exit 1)
+	@echo "Bumping to $(NEW_VERSION)..."
+	@sed -i '' 's/"version": "[^"]*"/"version": "$(NEW_VERSION)"/g' .claude-plugin/marketplace.json
+	@sed -i '' 's/"version": "[^"]*"/"version": "$(NEW_VERSION)"/g' $(PLUGIN_DIR)/.claude-plugin/plugin.json
+	@sed -i '' 's/^version: .*/version: $(NEW_VERSION)/' $(SKILL_DIR)/SKILL.md
+	@git add .claude-plugin/marketplace.json $(PLUGIN_DIR)/.claude-plugin/plugin.json $(SKILL_DIR)/SKILL.md
+	@git commit -m "chore: bump version to $(NEW_VERSION)"
+	@git tag -a v$(NEW_VERSION) -m "Release v$(NEW_VERSION)"
+	@echo ""
+	@echo "Done. Run 'make release' to build and publish."
 
 release: all
 	@test "$(VERSION)" != "dev" || (echo "Error: no git tag found. Run: git tag -a vX.Y.Z -m 'Release vX.Y.Z'" && exit 1)
