@@ -1,6 +1,6 @@
 {
   "name": "indian-algo-trading",
-  "version": "1.1.4",
+  "version": "1.1.5",
   "description": "Indian algo trading skill suite for strategy design, backtesting, risk management, execution, and broker integration.",
   "author": {
     "name": "Rupeezy"

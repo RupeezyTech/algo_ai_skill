@@ -14,7 +14,7 @@ description: >
   Vortex API, vortex-api, or asks about F&O strategy automation, options selling bot,
   intraday strategy, or positional strategy. Even if the user just says "write a strategy"
   or "help me automate my trading" — use this skill.
-version: 1.1.4
+version: 1.1.5
 ---
 
 # Indian Algo Trading — Strategy Writing Skill
