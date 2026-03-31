@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "rupeezy-trading": {
+      "type": "http",
+      "url": "https://mcp.rupeezy.in/mcp"
+    },
+    "rupeezy-strategy": {
+      "type": "http",
+      "url": "https://mcp.rupeezy.in/mcp-strategy"
+    }
+  }
+}

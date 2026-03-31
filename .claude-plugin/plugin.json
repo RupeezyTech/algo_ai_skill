@@ -1,0 +1,9 @@
+{
+  "name": "indian-algo-trading",
+  "version": "1.0.0",
+  "description": "Write production-quality Python algo trading strategies for Indian markets (NSE, BSE, MCX). Includes AI skill with 16 reference files + Rupeezy MCP servers for live trading, strategy deployment, backtesting, and portfolio management.",
+  "author": {
+    "name": "Rupeezy"
+  },
+  "keywords": ["algo-trading", "indian-stock-market", "nse", "bse", "mcx", "python", "backtesting", "rupeezy", "vortex-api", "options-trading", "quantitative-trading"]
+}
