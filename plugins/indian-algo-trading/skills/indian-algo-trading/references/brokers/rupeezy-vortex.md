@@ -226,6 +226,18 @@ client.instruments.refresh()
                 and i.option_type in ("CE", "PE")
   )
   ```
+- **`Vc.*` constants are runtime-typed enums, NOT bare strings.** Every `transaction_type`, `product`, `variety`, `validity`, `mode`, `exchange`, `resolution` argument to the SDK is validated against the enum class by a decorator at `vortex_api/api.py:147` — strict `isinstance(value, param_type)`. Passing the string value (e.g. `"INTRADAY"`) raises `TypeError: <param> must be of type <EnumClass>`, **even though the enum's `.value` IS that string**. The check is class-based, not value-based. The mistake silently passes `py_compile` and unit tests; it only blows up at the first live `place_order` or `get_order_margin`. If you stash these in `config.py`, store the enum directly:
+  ```python
+  # WRONG — silent until first live order
+  default_product: str = "INTRADAY"
+  client.place_order(product=config.default_product, ...)  # TypeError
+
+  # RIGHT — typed at the source
+  from vortex_api import Constants as Vc
+  default_product: Vc.ProductTypes = Vc.ProductTypes.INTRADAY
+  client.place_order(product=config.default_product, ...)  # works
+  ```
+  If you must keep strings in config (e.g. driven by YAML/JSON), convert at the call site via `getattr(Vc.ProductTypes, name)` — but note the `getattr` argument is the **enum-member NAME**, not its `.value`. Many `Vc.*` enums have name ≠ value: `Vc.VarietyTypes.REGULAR_LIMIT_ORDER.value == "RL"`, `Vc.ValidityTypes.FULL_DAY.value == "DAY"`, `Vc.ExchangeTypes.NSE_EQUITY.value == "NSE_EQ"`. The scaffolded `config.py` stores enums directly to side-step both pitfalls.
 
 ### Lot Size & Tick Size
 
@@ -792,6 +804,8 @@ client.save_optimization_result(
 ## Constants Reference
 
 Access all constants via `from vortex_api import Constants as Vc`.
+
+> **Pass the enum, not the value.** The `Value` column below shows each constant's `.value` attribute (the underlying string), shown for reference and for parsing inbound payloads. **Do NOT pass the string to SDK calls** — the SDK strictly type-checks via `isinstance(value, EnumClass)` and rejects bare strings with `TypeError: <param> must be of type <EnumClass>`. See "Field-format quirks" → "Vc.* constants are runtime-typed enums" for the full rationale.
 
 ### Exchange Types
 

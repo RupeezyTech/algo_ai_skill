@@ -104,6 +104,8 @@ Handle SIGTERM/SIGINT: cancel pending orders, optionally square off, log final s
 
 These are non-negotiable. Every strategy must follow them.
 
+> **⚠ Silent-until-live failure modes: Rules 1, 11, 12, 13, 15.** These pass `py_compile`, `pytest`, and often a WebSocket smoke test — they blow up only on the first real broker interaction (or on a later trading day when something rolls). Walk these five explicitly whenever you scaffold or modify a strategy. Each rule's body names the specific failure.
+
 ### 1. NEVER hardcode instrument tokens
 
 Tokens change daily. Pass `ticker="<EXCHANGE>:<SYMBOL>"` to every Vortex API (`place_order`, `historical_candles`, `get_order_margin`, `client.quotes`, `wire.subscribe`) on `vortex-api >= 2.1.8`. Feed ticks carry `tick["ticker"]`.
@@ -153,68 +155,21 @@ Does **not** apply to the container platform — there `VORTEX_ACCESS_TOKEN` is 
 
 ### 9. Order updates have split authority across surfaces. Never sleep-poll.
 
-`VortexFeed.on_order_update` is the only way to learn an order changed in real time. Connect the feed *before* any `place_order` so the first push isn't lost. The callback fires for **five** envelope types — all signal that state changed for some `order_id`:
+`VortexFeed.on_order_update` is the only way to learn an order changed in real time. Connect the feed *before* any `place_order` so the first push isn't lost. The callback fires for **five** envelope types — `order`, `trade`, `sl_trigger`, `gtt_order`, `position_conversion` — all signal that state changed for some `order_id`. See `references/brokers/rupeezy-vortex.md` for the payload table and per-type meaning.
 
-| `msg["type"]` | What changed |
-|---|---|
-| `"order"` | order status transition |
-| `"trade"` | a fill happened (partial or final) |
-| `"sl_trigger"` | a stop-loss order triggered into a live order |
-| `"gtt_order"` | GTT placement / trigger lifecycle |
-| `"position_conversion"` | MIS ↔ CNC conversion |
+**Authority is split between surfaces** because REST orderbook can lag postbacks by tens of seconds on the same order:
 
-**Authority is split between surfaces — this matters because the REST orderbook can lag postbacks by tens of seconds on the same order:**
+- **Postback `data.status`** is authoritative for **status transitions** — believe terminal postbacks immediately, don't wait for REST.
+- **`client.orders()` / `client.trades()`** are authoritative for **fill quantities, traded_price, avg fill** — refresh from these on every postback (coalesced 500 ms debounce so a many-fill order doesn't trip the REST rate limit).
+- **Downgrade guard**: once terminal is recorded for an order_id, a later non-terminal REST row is stale — merge fill fields but DO NOT overwrite the status.
 
-- **Postback `data.status`** — authoritative for **status transitions**. WS pushes arrive within ms. If a postback says terminal (REJECTED / COMPLETED / CANCELLED), believe it immediately and fire your `on_terminal` callback. Don't wait for REST.
-- **`client.orders()` / `client.trades()`** — authoritative for **fill quantities, traded_price, and other fields the postback can drop or lag**. Refresh from these on every postback (coalesced 500 ms debounce) to fold in the canonical fill data.
-- **Downgrade guard**: once terminal is recorded for an order_id (from a postback), a later non-terminal REST row for that same order_id is **stale** — merge fill fields but DO NOT overwrite the status. `OrderTracker._apply` does this.
+**Do NOT poll** `client.orders()` / `client.order_history()` / `client.trades()` on a sleep-loop. Refresh-on-postback is event-driven — REST is called *only* when a postback indicates a change.
 
-Coalescing rule: first postback → 500 ms debounce → one `orders()` + `trades()` call → update local state → if new postbacks landed during the REST calls, refresh again immediately (no further wait). Postbacks during the 500 ms window accumulate for free, so a many-fill order doesn't trip the REST rate limit.
+**Order outcomes are events, not return values.** Live strategies wire `tracker.on_terminal = strategy.on_order_terminal` to receive `(order_id, status)` callbacks for every terminal transition. **Do NOT call `tracker.wait()` inside the strategy main loop** — `wait()` is the script / test / `cancel_and_wait()` primitive only; its `timeout` is required (pass `float("inf")` for forever). Call `tracker.initialize()` once at startup before placing orders so historical fills don't fire spurious callbacks.
 
-**Do NOT poll** `client.orders()` / `client.order_history()` / `client.trades()` on a sleep-loop. Polling is timer-driven. Refresh-on-postback is event-driven — the REST API is called *only* when a postback indicates something changed.
+Terminal-status detection is **substring-based** to catch broker-decorated forms (`REJECTED_BY_RMS`, `AMO_CANCELLED`); canonical tokens are `COMPLETED` / `EXECUTED` (same state — postback uses COMPLETED, orderbook uses EXECUTED), `REJECTED`, `CANCELLED`. Rejection-reason field name varies by surface (`status_message` / `error_reason` / `message`) — use `tracker.rejection_reason(order_id)`.
 
-**Order outcomes are events, not return values.** Live strategies wire `tracker.on_terminal = strategy.on_order_terminal` and receive `(order_id, status)` callbacks for every terminal transition — even if no thread was blocked waiting. **Do NOT call `tracker.wait()` inside the strategy main loop** (`next(tick)` or signal handlers); `wait()` is the script / test / `cancel_and_wait()` primitive only. Its `timeout` is required (pass `float("inf")` to wait forever). Call `tracker.initialize()` once at startup before placing any orders so `on_terminal` doesn't fire spuriously for orders that were already terminal earlier in the day.
-
-**Terminal-status detection is substring-based**, not strict set membership. Brokers may decorate canonical tokens (`REJECTED_BY_RMS`, `AMO_CANCELLED`, `EXECUTED_PARTIAL`); normalise via substring match against `("REJECTED", "CANCELLED", "EXECUTED", "COMPLETED")`. Canonical tokens: `"COMPLETED"`/`"EXECUTED"` (same state — postback uses COMPLETED, orderbook uses EXECUTED), `"REJECTED"`, `"CANCELLED"`. The reference `OrderTracker._terminal_token()` handles this.
-
-**Rejection reason field name varies by surface** — postback envelope uses `status_message`, REST orderbook row uses `error_reason`, `place_order` response uses `message`. Always check all three (or use `tracker.rejection_reason(order_id)` which does).
-
-```python
-# Minimal sketch — use OrderTracker (references/code-quality.md) in real strategies.
-import threading, time
-
-dirty, lock, running = set(), threading.Lock(), [False]
-
-def on_postback(ws, msg):
-    oid = (msg.get("data") or {}).get("order_id")
-    if not oid: return
-    with lock:
-        dirty.add(oid)
-        if not running[0]:
-            running[0] = True
-            try:
-                threading.Thread(target=worker, daemon=True).start()
-            except Exception:
-                running[0] = False  # reset on thread-start failure
-                raise
-
-def worker():
-    time.sleep(0.5)  # debounce: let bursty trade postbacks accumulate
-    while True:
-        with lock:
-            if not dirty:
-                running[0] = False; return
-            dirty.clear()
-        book, trades = client.orders(), client.trades()
-        # update local state from book + trades; fire any waiter Events here
-        # loop — no extra sleep; if more postbacks landed during the API call,
-        # the next iteration refreshes immediately.
-
-wire.on_order_update = on_postback   # SDK property name is legacy; receives all 5 types
-wire.connect(threaded=True)
-```
-
-For the full thread-safe class with `wait(order_id)`, `fills(order_id)`, `avg_fill_price(order_id)`, see `OrderTracker` in `references/code-quality.md`.
+The reference `OrderTracker` in `references/code-quality.md` (and the scaffolded `order_tracker.py`) implements all of this — wire it, don't re-implement.
 
 ### 10. NEVER short sell illiquid equities intraday
 
@@ -239,6 +194,22 @@ On expiry day, calendar-spread margin benefits are removed and required margin c
 ### 14. NSE has no public data API
 
 All market data (quotes, historical candles, OI, FII/DII, depth) must come through the broker API or third-party providers. Never write code that scrapes or calls NSE endpoints directly.
+
+### 15. Pass SDK enum instances, not their string values
+
+The Vortex SDK runtime-typechecks every `transaction_type`, `product`, `variety`, `validity`, `mode`, `exchange`, `resolution` argument via `isinstance(value, EnumClass)`. Passing the string value (`"INTRADAY"`) where the SDK expects the enum (`Vc.ProductTypes.INTRADAY`) raises `TypeError: product must be of type ProductTypes` **even though the enum's `.value` IS "INTRADAY"** — the check is class-based, not value-based. Silent until the first live `place_order` / `get_order_margin`; `py_compile` and unit tests don't catch it.
+
+```python
+from vortex_api import Constants as Vc
+
+# WRONG — string passes type-hint, fails at runtime on first live call
+client.place_order(product="INTRADAY", ...)
+
+# RIGHT — enum instance
+client.place_order(product=Vc.ProductTypes.INTRADAY, ...)
+```
+
+If you store these in `config.py`, store the enum directly (the scaffolded `config.py` does). Name ≠ value for many `Vc.*` enums (`Vc.VarietyTypes.REGULAR_LIMIT_ORDER.value == "RL"`, `Vc.ExchangeTypes.NSE_EQUITY.value == "NSE_EQ"`), so a stringly-typed config with `getattr(Vc.X, name)` lookup also works but only if you store the **member name**, not the value.
 
 ---
 

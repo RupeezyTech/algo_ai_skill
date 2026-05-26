@@ -482,6 +482,17 @@ All strategy and risk parameters defined in one place.
 
 Imports .env at module top so any downstream module reading os.environ
 at import time sees populated values, regardless of import order.
+
+SDK enum defaults (default_product, default_variety, default_validity,
+default_transaction_type) are stored as `Vc.*` enum INSTANCES, not as
+their string values. The Vortex SDK runtime-typechecks these arguments
+via `isinstance` and rejects bare strings — e.g. passing "INTRADAY"
+where `Vc.ProductTypes.INTRADAY` is expected raises
+`TypeError: product must be of type ProductTypes`, even though the
+enum\\'s `.value` IS "INTRADAY". The bug is silent until the first live
+order. Storing the enum here makes strategy code that writes
+`client.place_order(product=config.default_product, ...)` correct by
+construction.
 """
 
 from dataclasses import dataclass
@@ -495,6 +506,8 @@ except ImportError:
     # python-dotenv isn\\'t installed (e.g., container build with no .env file).
     # That\\'s fine — env vars are injected by the platform.
     pass
+
+from vortex_api import Constants as Vc
 
 
 @dataclass
@@ -511,8 +524,12 @@ class Config:
     market_open_time: str = "09:15"  # IST
     market_close_time: str = "15:30"  # IST
 
-    # Order parameters
-    default_product: str = "DELIVERY"  # or INTRADAY, MTF, BTST
+    # Order parameters — Vc.* ENUM INSTANCES, not strings (see module docstring).
+    # Pass these directly to client.place_order / client.get_order_margin.
+    default_product:    Vc.ProductTypes     = Vc.ProductTypes.DELIVERY
+    default_variety:    Vc.VarietyTypes     = Vc.VarietyTypes.REGULAR_LIMIT_ORDER
+    default_validity:   Vc.ValidityTypes    = Vc.ValidityTypes.FULL_DAY
+    default_transaction: Vc.TransactionSides = Vc.TransactionSides.BUY
     slippage_pct: float = 0.5  # Expected slippage tolerance
 
     # Backtest parameters
