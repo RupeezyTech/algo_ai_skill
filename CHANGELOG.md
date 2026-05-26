@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.9] - 2026-05-26
+
+### Changed
+
+- **Eliminated five places where the skill contradicted itself on the loopback OAuth login.** A clean read by an LLM consumer could previously interpret the manual auth-code paste flow as compliant. Specifically:
+  - Step 1 question 4 — "default to the loopback SSO pattern" rewritten as a hard `MUST` with an explicit decision tree ("self-hosted → ship login.py + auth.py" vs "container → don't"). Headless / SSH-only edge case is called out as non-exempting.
+  - Code Architecture diagram — the `(self-hosted only)` parenthetical that read as "optional" replaced with two explicit deployment-keyed file lists labelled `REQUIRED`.
+  - Critical Rule 8 — promoted from "use the loopback SSO login" (suggestion-flavoured) to "Self-hosted strategies MUST ship login.py + auth.py — no exceptions". Adds an explicit list of patterns that are forbidden (`input("auth code: ")`, `VORTEX_ACCESS_TOKEN` in `.env`, `broker.py` with a manual auth_code parameter) and rebuts three common edge-case excuses (headless box, "portal might not allow localhost", minimal-deps).
+  - Strategy Output Format (the section LLMs use as the final file checklist) — was omitting `login.py` and `auth.py` entirely. Now shows two deployment-keyed file lists; container packages explicitly **must not** include `login.py`/`auth.py`.
+  - `references/brokers/rupeezy-vortex.md` — deleted the "Advanced (only when the loopback server can't run)" escape hatch that explicitly told the LLM "headless → fall back to manual paste"; replaced with the SSH port-forward recipe. Collapsed the duplicate "Authentication / Self-Hosted OAuth Flow" subsection that was contradicting the Deployment Modes section above it.
+
 ## [1.1.7] - 2026-05-26
 
 ### Added

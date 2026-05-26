@@ -13,6 +13,7 @@ pip install vortex-api
 ```
 
 Add to `requirements.txt`:
+
 ```
 vortex-api>=2.1.8
 ```
@@ -28,11 +29,13 @@ vortex-api>=2.1.8
 Strategy runs inside a Docker container managed by Rupeezy. No Docker setup required. Code deployment is declarative — credentials are injected automatically.
 
 **Setup:**
+
 - Create zip bundle with `main.py` and `requirements.txt` at root level
 - Upload to platform; container builds and deploys automatically
 - Platform handles starting/stopping on user-configured schedules
 
 **Initialization:**
+
 ```python
 from vortex_api import VortexAPI
 
@@ -44,6 +47,7 @@ holdings = client.holdings()
 ```
 
 **Container constraints:**
+
 - Python 3.12, 3.13, or 3.14 only (slim image)
 - Only `vortex-api.rupeezy.in`, `wire.rupeezy.in`, `static.rupeezy.in` reachable
 - Do NOT write logs to files — use print() or client logger; view logs on platform
@@ -52,126 +56,39 @@ holdings = client.holdings()
 
 ### Self-Hosted (User's System)
 
-Strategy runs on your own machine/server. OAuth 2.0 authentication is mandatory — but **do not make the user copy/paste an auth code**. End users routinely confuse `auth_token` (the short-lived `?auth=...` query param) with `access_token` (the long-lived bearer token), and the resulting bug reports are painful. Ship a tiny local callback server that catches the redirect for them.
+Strategy runs on your own machine/server. Manual OAuth authentication required.
 
-**One-time setup:**
-1. Create an application in the [Rupeezy API Center](https://vortex.rupeezy.in) → obtain `application_id` and `api_key`.
-2. **Set the app's redirect URL to `http://127.0.0.1:8765/callback`** (the loopback address the script below listens on).
-3. Save `VORTEX_API_KEY` and `VORTEX_APPLICATION_ID` to `.env`. Do **not** save `VORTEX_ACCESS_TOKEN` to `.env` — it expires every ~24h.
+**Setup:**
 
-**`login.py` (run once per session, ~24h token lifetime):**
+1. Create application on Vortex portal → obtain Application ID and API Key
+2. Configure OAuth callback URL on portal
+3. Visit `https://flow.rupeezy.in?applicationId={APPLICATION_ID}`
+4. After login, capture `auth={auth_code}` from callback URL
+5. Exchange auth code for access token
+
+**Initialization:**
 
 ```python
-import threading
-import webbrowser
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import parse_qs, urlparse
-
 from vortex_api import VortexAPI
 
-from auth import API_KEY, APPLICATION_ID, save_token
+# Explicit credentials
+client = VortexAPI(api_key="your_api_key", application_id="your_application_id")
 
-HOST, PORT, PATH = "127.0.0.1", 8765, "/callback"
-
-
-class CallbackHandler(BaseHTTPRequestHandler):
-    auth_token = None
-
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path != PATH:
-            self.send_response(404); self.end_headers(); return
-        token = parse_qs(parsed.query).get("auth", [None])[0]
-        if token:
-            CallbackHandler.auth_token = token
-            self.send_response(200)
-            body = b"<h2>Login received. You can close this tab.</h2>"
-        else:
-            self.send_response(400)
-            body = b"<h2>Missing auth in callback.</h2>"
-        self.send_header("Content-Type", "text/html"); self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *_):
-        pass
-
-
-def main():
-    client = VortexAPI(API_KEY, APPLICATION_ID)
-
-    url = client.login_url(callback_param="strategy-login")
-    print(f"Listening on http://{HOST}:{PORT}{PATH}")
-    print(f"Opening browser: {url}")
-    webbrowser.open(url)
-
-    server = HTTPServer((HOST, PORT), CallbackHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    while CallbackHandler.auth_token is None:
-        thread.join(0.2)
-    server.shutdown()
-
-    client.exchange_token(CallbackHandler.auth_token)
-    save_token(client.access_token)
-
-
-if __name__ == "__main__":
-    main()
+# Exchange auth code for access token
+client.exchange_token("received_auth_code")
+# client.access_token is now available
 ```
 
-**`auth.py` (imported by both `login.py` and your strategy):**
+**Environment variables (recommended):**
 
-```python
-import json
-import os
-from pathlib import Path
-
-from dotenv import load_dotenv
-from vortex_api import VortexAPI
-
-load_dotenv()
-
-API_KEY = os.environ["VORTEX_API_KEY"]
-APPLICATION_ID = os.environ["VORTEX_APPLICATION_ID"]
-TOKEN_FILE = Path(__file__).parent / ".access_token.json"
-
-
-def get_client() -> VortexAPI:
-    """Return a VortexAPI client with the cached access_token loaded."""
-    client = VortexAPI(API_KEY, APPLICATION_ID)
-    if not TOKEN_FILE.exists():
-        raise RuntimeError("Run `python login.py` first to authenticate.")
-    client.access_token = json.loads(TOKEN_FILE.read_text())["access_token"]
-    return client
-
-
-def save_token(access_token: str) -> None:
-    TOKEN_FILE.write_text(json.dumps({"access_token": access_token}))
-```
-
-**Strategy code (`main.py`):**
-
-```python
-from auth import get_client
-
-client = get_client()       # raises a clear error if token cache is missing
-print(client.funds())
-```
-
-This is the pattern `scripts/scaffold_strategy.py` ships by default — use it as the template.
-
-**Advanced (only when the loopback server can't run):** if you're on a headless box, you can still drive the OAuth flow manually by opening `client.login_url(...)`, capturing the `?auth=...` param yourself, and calling `client.exchange_token(auth_token)`. But for anything resembling an interactive user, prefer the loopback flow.
-
-**Environment variables — supported:**
 ```bash
 export VORTEX_API_KEY=your_api_key
 export VORTEX_APPLICATION_ID=your_application_id
-# VORTEX_ACCESS_TOKEN is also supported by zero-arg init, but expires every ~24h.
-# Prefer the file-cache pattern above so login.py can refresh it non-interactively.
+export VORTEX_ACCESS_TOKEN=your_access_token
 ```
 
 ```python
-# Zero-arg init picks up credentials from environment (and access_token if set)
+# Zero-arg init picks up credentials from environment
 client = VortexAPI()
 ```
 
@@ -180,31 +97,42 @@ client = VortexAPI()
 ## Authentication
 
 ### Container Platform
+
 Credentials are injected at runtime. Use zero-argument initialization:
+
 ```python
 client = VortexAPI()
 ```
 
 Enable debug logging if needed:
+
 ```python
 client = VortexAPI(enable_logging=True)
 ```
 
 ### Self-Hosted OAuth Flow
 
-Prefer the **loopback SSO pattern** documented under [Self-Hosted (User's System)](#self-hosted-users-system) — it eliminates the auth_token-vs-access_token confusion that trips up end users. Mechanics under the hood:
+1. User visits `https://flow.rupeezy.in?applicationId={APPLICATION_ID}`
+2. After authentication, redirect contains `?auth={auth_code}`
+3. Exchange auth code for persistent access token:
 
-1. Browser opens `client.login_url(callback_param=...)`.
-2. After SSO, Rupeezy redirects to the app's configured callback URL with `?auth={auth_token}`.
-3. The local loopback server captures `auth_token` and calls `client.exchange_token(auth_token)`, which sets `client.access_token` (the long-lived bearer token — this is what you persist).
+```python
+from vortex_api import VortexAPI
 
-The `auth_token` is single-use and short-lived. The `access_token` is what every API call uses, and what you cache to `.access_token.json`. Never persist `auth_token`; never call API methods with it.
+client = VortexAPI(api_key="key", application_id="app_id")
+client.exchange_token(auth_code)  # Populates client.access_token
+
+# Save access_token for future use — it persists across sessions
+saved_token = client.access_token
+```
 
 ### Environment Variables
+
 Both deployment modes support environment-based configuration:
-- `VORTEX_API_KEY` — API secret (self-hosted only). Persistent, store in `.env`.
-- `VORTEX_APPLICATION_ID` — Application ID (self-hosted only). Persistent, store in `.env`.
-- `VORTEX_ACCESS_TOKEN` — Access token. **Container platform only.** On self-hosted, this expires every ~24h; let `login.py` refresh it into `.access_token.json` instead of pinning a stale value in `.env`.
+
+- `VORTEX_API_KEY` — API secret (self-hosted only)
+- `VORTEX_APPLICATION_ID` — Application ID (self-hosted only)
+- `VORTEX_ACCESS_TOKEN` — Access token (optional, auto-generated on auth)
 
 ---
 
@@ -215,7 +143,7 @@ Tokens change daily. Identify instruments by their **ticker** (`<EXCHANGE>:<SYMB
 ### Ticker Conventions
 
 - **Equities** — `"NSE:RELIANCE"`, `"NSE:INFY"`, `"BSE:TATAMOTORS"`
-- **Indices** — append `IDX`: `"NSE:NIFTYIDX"`, `"NSE:BANKNIFTYIDX"`, `"NSE:FINNIFTYIDX"`, `"BSE:SENSEXIDX"`. The `symbol` field of the index *row* is still bare (`"NIFTY"`); the `IDX` suffix only lives on the ticker.
+- **Indices** — append `IDX`: `"NSE:NIFTYIDX"`, `"NSE:BANKNIFTYIDX"`, `"NSE:FINNIFTYIDX"`, `"BSE:SENSEXIDX"`. The `symbol` field of the index _row_ is still bare (`"NIFTY"`); the `IDX` suffix only lives on the ticker.
 - **F&O contracts** — every contract has its own ticker (e.g. `"NSE:NIFTY24DECFUT"`), but the **underlying symbol** stays bare. So filtering the option chain uses `symbol == "NIFTY"`, not `"NIFTYIDX"`.
 
 ### Lookups via `client.instruments`
@@ -265,16 +193,6 @@ price = round_to_tick(price, inst.tick)  # Round to nearest valid tick
 
 Only when you need to iterate the entire ~190k-row universe (e.g. computing aggregate analytics across all listed instruments). For any single lookup, `client.instruments.*` is dramatically faster and shares the same disk cache.
 
-### Advanced — `PYVORTEX_*` env vars
-
-The SDK defaults are sensible for almost every strategy. Strategy code should leave these alone; they're documented here only so you recognise them if you see them set in your environment.
-
-- `PYVORTEX_CACHE_DIR` — overrides the on-disk cache location (defaults to `~/.cache/pyvortex` with a `/tmp/pyvortex` fallback).
-- `PYVORTEX_REVALIDATE_SECONDS` — how long to trust the disk cache before issuing a conditional GET (default 900s).
-- `PYVORTEX_REQUEST_TIMEOUT` — HTTP timeout for the master download (default 30s).
-
-Do not set these from strategy code. If you need different behaviour, set them once at process startup (shell env, deployment manifest, etc.) — never inside `main.py`.
-
 ---
 
 ## Order Placement
@@ -302,23 +220,25 @@ print(f"Order ID: {order.get('data', {}).get('order_id')}")
 ```
 
 ### Parameters
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| ticker | str | Yes* | `<EXCHANGE>:<SYMBOL>` form, e.g. `"NSE:RELIANCE"`. Required unless legacy `exchange`+`token` are supplied. |
-| exchange | str | Legacy | Exchange type: NSE_EQ, BSE_EQ, NSE_FO, BSE_FO, MCX_FO. Required only with legacy `token`. Emits `FutureWarning`. |
-| token | int | Legacy | Instrument token from master. Required only with legacy `exchange`. Emits `FutureWarning`. |
-| transaction_type | str | Yes | BUY or SELL |
-| product | str | Yes | DELIVERY, INTRADAY, MTF |
-| variety | str | Yes | RL, RL-MKT, SL, SL-MKT |
-| quantity | int | Yes | Number of shares/units |
-| price | float | Yes | Limit price; 0 for market orders |
-| trigger_price | float | Yes | Trigger for stop-loss orders; 0 otherwise |
-| disclosed_quantity | int | No | Partial disclosure for iceberg orders |
-| validity | str | Yes | DAY, IOC, or AMO |
+
+| Parameter          | Type  | Required | Description                                                                                                      |
+| ------------------ | ----- | -------- | ---------------------------------------------------------------------------------------------------------------- |
+| ticker             | str   | Yes\*    | `<EXCHANGE>:<SYMBOL>` form, e.g. `"NSE:RELIANCE"`. Required unless legacy `exchange`+`token` are supplied.       |
+| exchange           | str   | Legacy   | Exchange type: NSE_EQ, BSE_EQ, NSE_FO, BSE_FO, MCX_FO. Required only with legacy `token`. Emits `FutureWarning`. |
+| token              | int   | Legacy   | Instrument token from master. Required only with legacy `exchange`. Emits `FutureWarning`.                       |
+| transaction_type   | str   | Yes      | BUY or SELL                                                                                                      |
+| product            | str   | Yes      | DELIVERY, INTRADAY, MTF                                                                                          |
+| variety            | str   | Yes      | RL, RL-MKT, SL, SL-MKT                                                                                           |
+| quantity           | int   | Yes      | Number of shares/units                                                                                           |
+| price              | float | Yes      | Limit price; 0 for market orders                                                                                 |
+| trigger_price      | float | Yes      | Trigger for stop-loss orders; 0 otherwise                                                                        |
+| disclosed_quantity | int   | No       | Partial disclosure for iceberg orders                                                                            |
+| validity           | str   | Yes      | DAY, IOC, or AMO                                                                                                 |
 
 ### Order Types
 
 **Regular Limit Order (RL)**
+
 ```python
 # Buy 1 share of Reliance at ₹2400
 order = client.place_order(
@@ -334,6 +254,7 @@ order = client.place_order(
 ```
 
 **Market Order (RL-MKT)**
+
 ```python
 # Buy immediately at market price
 order = client.place_order(
@@ -349,6 +270,7 @@ order = client.place_order(
 ```
 
 **Stop Loss Limit Order (SL)**
+
 ```python
 # Sell 1 share if price falls to ₹2350, at limit ₹2340
 order = client.place_order(
@@ -364,6 +286,7 @@ order = client.place_order(
 ```
 
 **Stop Loss Market Order (SL-MKT)**
+
 ```python
 # Sell immediately at market if price reaches trigger
 order = client.place_order(
@@ -379,6 +302,7 @@ order = client.place_order(
 ```
 
 ### Error Handling
+
 ```python
 import requests
 
@@ -394,6 +318,7 @@ except requests.exceptions.HTTPError as e:
 ```
 
 ### Margin Check Before Order
+
 ```python
 # Calculate required margin before placing order
 margin = client.get_order_margin(
@@ -421,6 +346,7 @@ else:
 ## Order Management
 
 ### Cancel Order
+
 ```python
 result = client.cancel_order(order_id="ORDER_ID_STRING")
 if result.get("status") == "success":
@@ -430,6 +356,7 @@ else:
 ```
 
 ### Modify Order
+
 ```python
 result = client.modify_order(
     order_id="ORDER_ID_STRING",
@@ -444,6 +371,7 @@ result = client.modify_order(
 ```
 
 ### Order History
+
 ```python
 history = client.order_history(order_id="ORDER_ID_STRING")
 # Returns list of status changes for a single order
@@ -452,6 +380,7 @@ for event in history.get("data", []):
 ```
 
 ### All Orders
+
 ```python
 orders = client.orders()
 for o in orders.get("data", []):
@@ -464,6 +393,7 @@ for o in orders.get("data", []):
 ## Portfolio Data
 
 ### Positions
+
 ```python
 positions = client.positions()
 
@@ -481,6 +411,7 @@ for pos in positions.get("data", {}).get("day", []):
 ```
 
 ### Holdings (Equity Delivery)
+
 ```python
 holdings = client.holdings()
 total_invested = 0
@@ -496,6 +427,7 @@ print(f"Total invested: {total_invested}")
 ```
 
 ### Funds
+
 ```python
 funds = client.funds()
 equity = funds.get("data", {}).get("equity", {})
@@ -507,6 +439,7 @@ print(f"Withdrawable: {equity.get('withdrawable_balance')}")
 ```
 
 ### Trades
+
 ```python
 trades = client.trades()
 
@@ -521,6 +454,7 @@ for t in trades.get("trades", []):
 ## Market Data
 
 ### Live Quotes
+
 ```python
 # Pass tickers directly (vortex-api >= 2.1.8)
 quotes = client.quotes(
@@ -533,11 +467,13 @@ for key, q in quotes.get("data", {}).items():
 ```
 
 **Quote Modes:**
+
 - `LTP` — Last Traded Price only (smallest data)
 - `OHLCV` — Open, High, Low, Close, Volume + LTP
 - `FULL` — OHLCV + bid/ask depth (5 levels) + open interest + DPR limits
 
 ### Historical Candles
+
 ```python
 import datetime
 
@@ -563,10 +499,12 @@ for i in range(len(candles["t"])):
 ```
 
 **Resolution Options:**
+
 - Intraday: 1, 2, 3, 4, 5, 10, 15, 30, 45, 60, 120, 180, 240 minutes
 - Daily, Weekly, Monthly: 1D, 1W, 1M
 
 **Data Availability:**
+
 - Equities: Years of history
 - Intraday candles: ~3 months
 - Futures: Current contract only (expired contracts deleted)
@@ -579,6 +517,7 @@ for i in range(len(candles["t"])):
 Real-time price updates and order notifications via WebSocket.
 
 ### Setup
+
 ```python
 from vortex_api import VortexFeed
 from vortex_api import Constants as Vc
@@ -589,6 +528,7 @@ wire = VortexFeed(access_token=client.access_token)
 ```
 
 ### Callbacks
+
 ```python
 def on_connect(ws, response):
     """Called when WebSocket is ready. Subscribe here."""
@@ -621,6 +561,7 @@ wire.on_error = on_error
 ```
 
 ### Connection
+
 ```python
 # Threaded mode — main thread continues after this line
 wire.connect(threaded=True)
@@ -630,19 +571,17 @@ wire.connect()
 ```
 
 ### Subscribe / Unsubscribe
-```python
-# Ticker form (preferred)
-wire.subscribe(ticker="NSE:RELIANCE", mode="ltp")
-wire.unsubscribe(ticker="NSE:RELIANCE")
 
-# Legacy form — still accepted, emits FutureWarning
-wire.subscribe(exchange="NSE_EQ", token=2885, mode="ltp")
-wire.unsubscribe(exchange="NSE_EQ", token=2885)
+```python
+# Subscribe to an instrument
+wire.subscribe("NSE_EQ", 2885, "ltp")
+
+# Unsubscribe
+wire.unsubscribe("NSE_EQ", 2885)
 ```
 
-`VortexFeed` auto-constructs an `InstrumentManager` so every tick is tagged with a `ticker` field, regardless of how you subscribed. To share the cache with the REST client, pass `instruments=client.instruments` to the `VortexFeed` constructor.
-
 ### Important Notes
+
 - **Connect immediately after initializing the client** — if you place an order before connecting, you'll miss the order update notification
 - **Subscribe in on_connect()** — subscriptions are re-established automatically on reconnect
 - **Reconnection is automatic** — SDK handles retries with exponential backoff; do not implement reconnect logic yourself
@@ -655,11 +594,13 @@ wire.unsubscribe(exchange="NSE_EQ", token=2885)
 The platform supports multiple Python backtesting libraries. Results are saved and visualized on the web dashboard.
 
 ### Supported Libraries
+
 - **backtesting.py** — Pass stats from `Backtest.run()`
 - **vectorbt** — Pass a `vbt.Portfolio` object
 - **backtrader** — Pass the strategy from `cerebro.run()[0]`
 
 ### Save Backtest Result
+
 ```python
 from backtesting import Backtest, Strategy
 
@@ -676,6 +617,7 @@ client.save_backtest_result(
 ```
 
 **Parameters:**
+
 - `stats` (required) — Result object from backtesting library
 - `name` (required) — Display name
 - `symbol` — Instrument symbol
@@ -685,19 +627,23 @@ client.save_backtest_result(
 **Returns:** `{"status": "success", "backtest_id": "uuid", "url": "..."}`
 
 ### Data Preparation for backtesting.py
+
 ```python
 import datetime
 import pandas as pd
 from vortex_api import VortexAPI, Constants as Vc
 
 client = VortexAPI()
+master = client.download_master()
+token = lookup_token(master, "RELIANCE", "NSE_EQ")
 
-# Fetch daily candles — ticker form (vortex-api >= 2.1.8)
+# Fetch daily candles
 end = datetime.datetime.now()
 start = end - datetime.timedelta(days=365)
 
 candles = client.historical_candles(
-    ticker="NSE:RELIANCE",
+    exchange=Vc.ExchangeTypes.NSE_EQUITY,
+    token=token,
     to=end,
     start=start,
     resolution=Vc.Resolutions.DAY,
@@ -747,6 +693,7 @@ client.save_backtest_result(
 ```
 
 ### Parameter Optimization
+
 ```python
 bt = Backtest(df, SmaCross, cash=100_000, commission=0.001)
 
@@ -777,61 +724,68 @@ client.save_optimization_result(
 Access all constants via `from vortex_api import Constants as Vc`.
 
 ### Exchange Types
-| Constant | Value | Exchange |
-|----------|-------|----------|
-| Vc.ExchangeTypes.NSE_EQUITY | "NSE_EQ" | NSE stocks & indices |
-| Vc.ExchangeTypes.BSE_EQUITY | "BSE_EQ" | BSE stocks |
-| Vc.ExchangeTypes.NSE_FO | "NSE_FO" | NSE futures & options |
-| Vc.ExchangeTypes.BSE_FO | "BSE_FO" | BSE futures & options |
-| Vc.ExchangeTypes.MCX | "MCX_FO" | MCX commodity futures |
+
+| Constant                      | Value    | Exchange                 |
+| ----------------------------- | -------- | ------------------------ |
+| Vc.ExchangeTypes.NSE_EQUITY   | "NSE_EQ" | NSE stocks & indices     |
+| Vc.ExchangeTypes.BSE_EQUITY   | "BSE_EQ" | BSE stocks               |
+| Vc.ExchangeTypes.NSE_FO       | "NSE_FO" | NSE futures & options    |
+| Vc.ExchangeTypes.BSE_FO       | "BSE_FO" | BSE futures & options    |
+| Vc.ExchangeTypes.MCX          | "MCX_FO" | MCX commodity futures    |
 | Vc.ExchangeTypes.NSE_CURRENCY | "NSE_CD" | NSE currency derivatives |
 
 ### Transaction Types
-| Constant | Value |
-|----------|-------|
-| Vc.TransactionSides.BUY | "BUY" |
+
+| Constant                 | Value  |
+| ------------------------ | ------ |
+| Vc.TransactionSides.BUY  | "BUY"  |
 | Vc.TransactionSides.SELL | "SELL" |
 
 ### Order Varieties
-| Constant | Value | Description |
-|----------|-------|-------------|
-| Vc.VarietyTypes.REGULAR_LIMIT_ORDER | "RL" | Limit order |
-| Vc.VarietyTypes.REGULAR_MARKET_ORDER | "RL-MKT" | Market order |
-| Vc.VarietyTypes.STOP_LIMIT_ORDER | "SL" | Stop loss + limit |
-| Vc.VarietyTypes.STOP_MARKET_ORDER | "SL-MKT" | Stop loss + market |
+
+| Constant                             | Value    | Description        |
+| ------------------------------------ | -------- | ------------------ |
+| Vc.VarietyTypes.REGULAR_LIMIT_ORDER  | "RL"     | Limit order        |
+| Vc.VarietyTypes.REGULAR_MARKET_ORDER | "RL-MKT" | Market order       |
+| Vc.VarietyTypes.STOP_LIMIT_ORDER     | "SL"     | Stop loss + limit  |
+| Vc.VarietyTypes.STOP_MARKET_ORDER    | "SL-MKT" | Stop loss + market |
 
 ### Product Types
-| Constant | Value | Description |
-|----------|-------|-------------|
-| Vc.ProductTypes.DELIVERY | "DELIVERY" | CNC — held in demat |
+
+| Constant                 | Value      | Description                  |
+| ------------------------ | ---------- | ---------------------------- |
+| Vc.ProductTypes.DELIVERY | "DELIVERY" | CNC — held in demat          |
 | Vc.ProductTypes.INTRADAY | "INTRADAY" | MIS — squared off at day end |
-| Vc.ProductTypes.MTF | "MTF" | Margin trading (NSE_EQ only) |
+| Vc.ProductTypes.MTF      | "MTF"      | Margin trading (NSE_EQ only) |
 
 ### Validity Types
-| Constant | Value | Description |
-|----------|-------|-------------|
-| Vc.ValidityTypes.FULL_DAY | "DAY" | Valid until end of trading day |
-| Vc.ValidityTypes.IMMEDIATE_OR_CANCEL | "IOC" | Immediate execution or cancel |
-| Vc.ValidityTypes.AFTER_MARKET | "AMO" | After-market order |
+
+| Constant                             | Value | Description                    |
+| ------------------------------------ | ----- | ------------------------------ |
+| Vc.ValidityTypes.FULL_DAY            | "DAY" | Valid until end of trading day |
+| Vc.ValidityTypes.IMMEDIATE_OR_CANCEL | "IOC" | Immediate execution or cancel  |
+| Vc.ValidityTypes.AFTER_MARKET        | "AMO" | After-market order             |
 
 ### Quote Modes
-| Constant | Value | Data |
-|----------|-------|------|
-| Vc.QuoteModes.LTP | "ltp" | Last traded price only |
-| Vc.QuoteModes.OHLCV | "ohlcv" | OHLCV + LTP |
-| Vc.QuoteModes.FULL | "full" | OHLCV + depth + OI + DPR |
+
+| Constant            | Value   | Data                     |
+| ------------------- | ------- | ------------------------ |
+| Vc.QuoteModes.LTP   | "ltp"   | Last traded price only   |
+| Vc.QuoteModes.OHLCV | "ohlcv" | OHLCV + LTP              |
+| Vc.QuoteModes.FULL  | "full"  | OHLCV + depth + OI + DPR |
 
 ### Resolutions (Historical Candles)
-| Constant | Value | Period |
-|----------|-------|--------|
-| Vc.Resolutions.MIN_1 | "1" | 1 minute |
-| Vc.Resolutions.MIN_5 | "5" | 5 minutes |
-| Vc.Resolutions.MIN_15 | "15" | 15 minutes |
-| Vc.Resolutions.MIN_30 | "30" | 30 minutes |
-| Vc.Resolutions.MIN_60 | "60" | 1 hour |
-| Vc.Resolutions.DAY | "1D" | Daily |
-| Vc.Resolutions.WEEK | "1W" | Weekly |
-| Vc.Resolutions.MONTH | "1M" | Monthly |
+
+| Constant              | Value | Period     |
+| --------------------- | ----- | ---------- |
+| Vc.Resolutions.MIN_1  | "1"   | 1 minute   |
+| Vc.Resolutions.MIN_5  | "5"   | 5 minutes  |
+| Vc.Resolutions.MIN_15 | "15"  | 15 minutes |
+| Vc.Resolutions.MIN_30 | "30"  | 30 minutes |
+| Vc.Resolutions.MIN_60 | "60"  | 1 hour     |
+| Vc.Resolutions.DAY    | "1D"  | Daily      |
+| Vc.Resolutions.WEEK   | "1W"  | Weekly     |
+| Vc.Resolutions.MONTH  | "1M"  | Monthly    |
 
 ---
 
@@ -840,29 +794,35 @@ Access all constants via `from vortex_api import Constants as Vc`.
 When deploying to Rupeezy's container platform, follow these constraints:
 
 ### Networking
+
 - Only three hosts are reachable: `vortex-api.rupeezy.in`, `wire.rupeezy.in`, `static.rupeezy.in`
 - Do not make external API calls (no requests to third-party services)
 - Use only bundled Python packages
 
 ### Logging & Debugging
+
 - Do not write logs to files — logs are not accessible to users
 - Use `print()` or the client's built-in logger; view logs on the platform dashboard
 - Enable SDK debug logging with `client = VortexAPI(enable_logging=True)` if requested
 
 ### Scheduling
+
 - Do not implement scheduling logic in code
 - Rupeezy platform manages start/stop times via cron expressions
 - Each container invocation runs the strategy once from start to finish
 - Use tools `create_schedule`, `list_schedules`, `update_schedule` to set up automated runs
 
 ### Python Version
+
 - Use Python 3.12, 3.13, or 3.14
 - Containers run on `python:{version}-slim` image (minimal dependencies)
 
 ### Requirements File
+
 Keep `requirements.txt` minimal. Example:
+
 ```
-vortex-api>=2.1.8
+vortex-api>=1.0.0
 pandas>=2.0.0
 numpy>=1.24.0
 ```
@@ -872,6 +832,7 @@ numpy>=1.24.0
 ## Common Patterns
 
 ### Full Order Lifecycle
+
 ```python
 from vortex_api import VortexAPI, VortexFeed
 from vortex_api import Constants as Vc
@@ -879,8 +840,11 @@ import time
 
 client = VortexAPI()
 
-# Connect feed BEFORE placing order (don't miss update).
-# VortexFeed auto-constructs an InstrumentManager and tags every tick with a `ticker` field.
+# Download master and look up token
+master = client.download_master()
+token = lookup_token(master, "RELIANCE", "NSE_EQ")
+
+# Connect feed BEFORE placing order (don't miss update)
 wire = VortexFeed(access_token=client.access_token)
 
 orders_placed = {}
@@ -896,9 +860,10 @@ wire.connect(threaded=True)
 
 time.sleep(1)  # Let connection stabilize
 
-# Place order — ticker form
+# Place order
 order = client.place_order(
-    ticker="NSE:RELIANCE",
+    exchange=Vc.ExchangeTypes.NSE_EQUITY,
+    token=token,
     transaction_type=Vc.TransactionSides.BUY,
     product=Vc.ProductTypes.DELIVERY,
     variety=Vc.VarietyTypes.REGULAR_LIMIT_ORDER,
@@ -924,6 +889,7 @@ wire.close()
 ```
 
 ### Position Monitoring
+
 ```python
 import time
 
@@ -934,13 +900,14 @@ positions_data = {}
 
 def on_price_update(ws, data):
     for tick in data:
-        # Key the cache by ticker — same string we used to subscribe
-        positions_data[tick["ticker"]] = tick["last_trade_price"]
+        token = tick["token"]
+        ltp = tick["last_trade_price"]
+        positions_data[token] = ltp
 
 def on_connect(ws, response):
     # Subscribe to monitored instruments
-    ws.subscribe(ticker="NSE:RELIANCE", mode="ltp")
-    ws.subscribe(ticker="NSE:NIFTYIDX", mode="ltp")
+    ws.subscribe("NSE_EQ", 2885, "ltp")
+    ws.subscribe("NSE_EQ", 26000, "ltp")
 
 wire.on_connect = on_connect
 wire.on_price_update = on_price_update
@@ -950,15 +917,14 @@ wire.connect(threaded=True)
 for i in range(60):
     positions = client.positions()
     for pos in positions.get("data", {}).get("net", []):
-        # Resolve the ticker for this position via the instrument manager
-        inst = client.instruments.get_by_exchange_token(pos.get("exchange"), pos.get("token"))
+        token = pos.get("token")
         qty = pos.get("quantity")
         avg = pos.get("average_price")
 
-        if inst.ticker in positions_data:
-            ltp = positions_data[inst.ticker]
+        if token in positions_data:
+            ltp = positions_data[token]
             pnl = (ltp - avg) * qty
-            print(f"  {inst.ticker}: qty={qty}, avg={avg}, ltp={ltp}, P&L={pnl}")
+            print(f"  {pos.get('symbol')}: qty={qty}, avg={avg}, ltp={ltp}, P&L={pnl}")
 
     time.sleep(1)
 
@@ -966,6 +932,7 @@ wire.close()
 ```
 
 ### Risk Management
+
 ```python
 def can_trade(client, required_capital):
     """Check if sufficient margin available before placing order."""
@@ -985,6 +952,7 @@ else:
 ## Error Handling
 
 ### Order Rejection
+
 ```python
 order = client.place_order(...)
 
@@ -998,6 +966,7 @@ elif order.get("status") == "success":
 ```
 
 ### API Errors
+
 ```python
 import requests
 
@@ -1018,9 +987,9 @@ except Exception as e:
 This reference covers the complete Vortex SDK workflow: initialization, authentication, master data lookup, order placement, portfolio monitoring, market data, backtesting, and deployment. Follow the patterns here to build robust algorithmic trading strategies on Rupeezy's platform.
 
 **Key takeaways:**
-- Identify instruments by their **ticker** (`"NSE:RELIANCE"`); pass `ticker=` to `place_order`, `historical_candles`, `get_order_margin`, `quotes`, and `wire.subscribe`. Never hardcode tokens — they change daily.
-- Read instrument metadata (lot size, tick size, ISIN) from `client.instruments.get_by_ticker(...)`.
-- Connect WebSocket immediately after client initialization.
-- Use container platform for managed deployment; self-hosted for custom control.
-- Backtest strategies before going live using `save_backtest_result()`.
-- Handle errors gracefully; verify margin before placing orders.
+
+- Always look up tokens by symbol — never hardcode
+- Connect WebSocket immediately after client initialization
+- Use container platform for managed deployment; self-hosted for custom control
+- Backtest strategies before going live using save_backtest_result()
+- Handle errors gracefully; verify margin before placing orders

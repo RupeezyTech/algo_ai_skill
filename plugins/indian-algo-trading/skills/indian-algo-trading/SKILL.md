@@ -31,13 +31,13 @@ Ask these questions (skip any the user has already answered):
 1. **What are you trading?** Equity, F&O (futures/options), currency derivatives, or commodities?
 2. **Live trading or backtesting?** Are you writing code to execute real trades, or to test a strategy on historical data?
 3. **Which broker?** Rupeezy/Vortex (primary), or another broker? Read `references/brokers/rupeezy-vortex.md` for Rupeezy. For others, check if a broker adapter exists in `references/brokers/`.
-4. **Deployment mode?** Running on Rupeezy's container platform (auto-auth, no OAuth needed),
-   or self-hosted on own machine? All Indian brokers mandatorily use OAuth 2.0 for
-   self-hosted strategies — the code must handle the OAuth callback flow to obtain
-   an access_token. For self-hosted, **default to the loopback SSO pattern** (a tiny
-   local HTTP server that catches the redirect automatically) — never ask the user to
-   copy/paste an auth_token. See Critical Rule 8 and `scripts/scaffold_strategy.py`.
-   Container platforms (like Rupeezy's) inject credentials automatically.
+4. **Deployment mode?** This question changes what files you generate. There are exactly two answers:
+
+   **a) Self-hosted** (anything the user runs themselves: own laptop, own VPS, own server, cron on their machine, headless box, EC2 instance, etc.). The strategy package **MUST include** `login.py` and `auth.py`. `login.py` runs a loopback HTTP server on `127.0.0.1:8765/callback`, opens the SSO URL in the browser via `webbrowser.open()`, captures the `?auth=...` query param, calls `client.exchange_token()`, and caches `access_token` to `.access_token.json`. `auth.py` exposes `get_client()` which the rest of the strategy uses. **Do not ask the user to copy/paste an auth_token.** Do not generate "manual OAuth paste" code. See Critical Rule 8 — it is non-negotiable.
+
+   **b) Rupeezy container platform** (user uploads a zip via the Rupeezy MCP, platform manages the container). The strategy package **MUST NOT include** `login.py` or `auth.py`. The platform injects `VORTEX_ACCESS_TOKEN` at runtime; `main.py` uses zero-arg `VortexAPI()` directly.
+
+   If the user is ambiguous, ask. If they say "local", "my machine", "my laptop", "my server", "self-hosted", or "I'll run it myself" — that is answer (a) and you MUST scaffold the loopback OAuth server. Headless boxes do not change this — the server binds to 127.0.0.1 and the user opens the SSO URL on whichever device has a browser; SSH port-forwarding handles the callback.
 5. **Risk tolerance?** Max loss per trade, max daily loss, max drawdown they're comfortable with. If they don't know, suggest safe defaults: 1% per trade, 3% daily, 10% max drawdown.
 
 ### Step 2: Discuss Strategy Design
@@ -91,10 +91,12 @@ Every strategy MUST follow this structure. No exceptions.
 
 ### Separation of Concerns
 
+**Self-hosted strategies (user runs the code on their own machine) — REQUIRED files:**
+
 ```
 main.py          → Entry point, initialization, scheduling
-login.py         → Loopback SSO callback server (self-hosted only) — run once per session
-auth.py          → Credential helpers: get_client(), save_token() (self-hosted only)
+login.py         → REQUIRED. Loopback SSO callback server. User runs it once per ~24h.
+auth.py          → REQUIRED. Credential helpers: get_client(), save_token().
 strategy.py      → Signal generation ONLY (no order placement here)
 execution.py     → Order placement, fill tracking (no signal logic here)
 risk_manager.py  → Position sizing, exposure checks, drawdown limits
@@ -102,7 +104,18 @@ guardrails.py    → Psychological guardrails (daily loss limits, cooldowns)
 config.py        → All configurable parameters (no hardcoded values)
 ```
 
-`login.py` and `auth.py` exist only for **self-hosted** deployments. On the Rupeezy container platform, the runtime injects `VORTEX_ACCESS_TOKEN` directly and `VortexAPI()` is zero-argument — no login flow needed.
+**Rupeezy container platform — REQUIRED files (no login.py / auth.py):**
+
+```
+main.py          → Entry point; uses zero-arg VortexAPI() (platform injects credentials)
+strategy.py      → Signal generation
+execution.py     → Order placement
+risk_manager.py  → Risk checks
+guardrails.py    → Guardrails
+config.py        → All parameters
+```
+
+The deciding question: does the user run the Python script themselves? If yes → self-hosted, ship `login.py` + `auth.py`. If they upload a zip via the Rupeezy MCP → container, skip them. There is no third mode.
 
 Signal generation and execution are ALWAYS in separate modules. This allows:
 
@@ -214,37 +227,47 @@ IST = pytz.timezone("Asia/Kolkata")
 
 All time comparisons use IST. Never rely on system timezone.
 
-### 8. Use the loopback SSO login for self-hosted strategies
+### 8. Self-hosted strategies MUST ship `login.py` + `auth.py` — no exceptions
 
-**End users routinely confuse `auth_token` with `access_token`.** They are different:
+If the user is running the strategy on their own machine (laptop, VPS, EC2, headless box, anywhere they invoke `python main.py` themselves), the generated package **MUST include** `login.py` (loopback OAuth server) and `auth.py` (credential helpers). This is not a suggestion, not a default, not "prefer when convenient". It is mandatory.
 
-- `auth_token` — the short-lived `?auth=...` query parameter that lands on the OAuth callback URL.
-- `access_token` — the long-lived bearer token that `client.exchange_token(auth_token)` returns. This is the one you save and pass into `VortexAPI`.
+**Why this rule exists.** End users routinely confuse `auth_token` with `access_token`:
 
-**Never ask the user to copy/paste either of these.** For self-hosted strategies, always ship a `login.py` script that:
+- `auth_token` — the short-lived `?auth=...` query parameter that lands on the OAuth callback URL. Single-use, expires in minutes.
+- `access_token` — the long-lived bearer token that `client.exchange_token(auth_token)` returns. This is what every API call uses, what you cache, and what you pass into `VortexAPI`.
+
+Every "my strategy stopped working after a day" bug report traces back to a user pasting an `auth_token` where the SDK wanted an `access_token`. The loopback server pattern eliminates the confusion at the source by doing the exchange automatically.
+
+**What `login.py` does (this is the only correct implementation):**
 
 1. Spins up a stdlib `HTTPServer` on `127.0.0.1:8765/callback`.
 2. Opens `client.login_url(callback_param=...)` in the browser via `webbrowser.open(...)`.
 3. Captures the `?auth=...` query param from the redirect.
-4. Calls `client.exchange_token(auth_token)` automatically.
+4. Calls `client.exchange_token(auth_token)` automatically — user never sees this token.
 5. Caches `client.access_token` to `.access_token.json`.
 
-The user runs `python login.py` once per session (~24h token lifetime); the main strategy reads the cached token via an `auth.get_client()` helper.
+`main.py` and the rest of the strategy read the cached token via `auth.get_client()`. The user runs `python login.py` once per ~24h.
 
-```python
-# auth.py — strategy code uses this
-from vortex_api import VortexAPI
-client = get_client()  # raises a clear error if .access_token.json is missing
+**What you must NOT generate** (these are all wrong, regardless of how the user phrases the request):
 
-# .env — only the persistent credentials live here
-VORTEX_API_KEY=...
-VORTEX_APPLICATION_ID=...
-# DO NOT put VORTEX_ACCESS_TOKEN in .env — it goes stale in 24h
-```
+- Code that prints "paste your auth code here" or `input("auth code: ")`.
+- Code that reads `VORTEX_ACCESS_TOKEN` from `.env`. The `.env` file holds only `VORTEX_API_KEY` and `VORTEX_APPLICATION_ID` (both persistent); the `access_token` lives in `.access_token.json`, populated by `login.py`.
+- Code that does `client.exchange_token(...)` with a hand-pasted argument anywhere in the strategy.
+- A `broker.py` or similar abstraction that exposes a manual auth_code parameter to the user.
 
-The user's one-time setup: in the Rupeezy API Center, set the app redirect URL to `http://127.0.0.1:8765/callback`. The scaffolder (`scripts/scaffold_strategy.py`) ships this pattern by default — use it as the template when writing strategies from scratch.
+**Edge cases that do NOT exempt you from this rule:**
 
-This rule does **not** apply to container deployments — Rupeezy's platform authenticates directly, and `VortexAPI()` is zero-argument.
+- Headless box / no GUI on the strategy machine → user opens the SSO URL on whatever device has a browser; SSH local port-forwarding (`ssh -L 8765:127.0.0.1:8765 user@server`) makes the loopback callback reach the box. Still scaffold `login.py`.
+- "Vortex portal might not allow `127.0.0.1` as a redirect URI" → it does. The user configures it themselves under their app's settings in the API Center.
+- Minimal-dependencies request → `login.py` uses only stdlib (`http.server`, `webbrowser`, `urllib.parse`, `threading`). No extra deps.
+
+**User's one-time setup** (instruct them to do this; do not do it in code):
+
+In the Rupeezy API Center → their app → set the redirect URL to `http://127.0.0.1:8765/callback`. Tell them this exactly once when you ship the strategy.
+
+The scaffolder (`scripts/scaffold_strategy.py --deployment self-hosted`) generates these files correctly. When writing strategies from scratch, replicate that pattern.
+
+**This rule does NOT apply to the Rupeezy container platform.** When the user uploads a zip via the Rupeezy MCP, the platform injects `VORTEX_ACCESS_TOKEN` at runtime. In that mode, `main.py` does zero-arg `VortexAPI()` and **must not include** `login.py` or `auth.py` (they'd be dead code that breaks at runtime — no browser, no writable disk for the token cache).
 
 ### 9. Connect WebSocket BEFORE placing orders
 
@@ -329,20 +352,38 @@ choices — fragile strategies that only work with exact parameters are overfitt
 
 ## Strategy Output Format
 
-When generating a complete strategy, output these files:
+The file list depends on deployment mode (see Step 1 question 4 and Critical Rule 8). There are only two correct shapes.
+
+**Self-hosted (user runs `python main.py` themselves):**
 
 ```
 strategy_name/
-├── main.py              # Entry point
+├── main.py              # Entry point. Calls auth.get_client(); never touches credentials directly.
+├── login.py             # REQUIRED. Loopback OAuth server. Run once per ~24h.
+├── auth.py              # REQUIRED. get_client() + save_token() helpers.
 ├── strategy.py          # Signal generation
 ├── risk_manager.py      # Risk checks
 ├── config.py            # All parameters
-├── requirements.txt     # Dependencies
+├── requirements.txt     # vortex-api>=2.1.8, python-dotenv, pandas, numpy, pytz
+├── .env.example         # VORTEX_API_KEY + VORTEX_APPLICATION_ID only (never VORTEX_ACCESS_TOKEN)
+└── README.md            # What this strategy does, parameters, risks, login flow instructions
+```
+
+**Rupeezy container platform (user uploads a zip via the Rupeezy MCP):**
+
+```
+strategy_name/
+├── main.py              # Uses zero-arg VortexAPI() — platform injects VORTEX_ACCESS_TOKEN
+├── strategy.py          # Signal generation
+├── risk_manager.py      # Risk checks
+├── config.py            # All parameters
+├── requirements.txt     # vortex-api>=2.1.8, pandas, numpy, pytz (NO python-dotenv)
 └── README.md            # What this strategy does, parameters, risks
 ```
 
-For backtest-only strategies, a single file is acceptable but must still include:
-risk management, realistic costs, and clear parameter documentation.
+Container packages **must not** include `login.py` or `auth.py` (no browser, no writable disk for token cache — they'd break at runtime). Self-hosted packages **must always** include both.
+
+For backtest-only strategies, a single file is acceptable but must still include: risk management, realistic costs, and clear parameter documentation. Backtests don't need `login.py` if they only read cached historical data and never call live APIs — but if they touch `VortexAPI`, the self-hosted layout applies.
 
 ---
 
