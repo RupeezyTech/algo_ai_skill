@@ -221,7 +221,9 @@ def write_strategy_py(base_dir, strategy_type):
         refresh worker.
         """
         order = self.tracker.order(order_id)
-        if status == "COMPLETED":
+        # COMPLETED (from postback) and EXECUTED (from orderbook) are the same
+        # state — check SUCCESS set, not the literal string.
+        if status in self.tracker.SUCCESS:
             avg = self.tracker.avg_fill_price(order_id)
             qty = order.get("traded_quantity")
             side = order.get("transaction_type")
@@ -231,9 +233,11 @@ def write_strategy_py(base_dir, strategy_type):
             )
             # TODO: update self.positions, self.pnl, etc.
         elif status == "REJECTED":
+            # rejection_reason walks the three field names the broker uses
+            # across surfaces (status_message / error_reason / message).
             logger.warning(
                 "REJECTED order_id=%s reason=%s",
-                order_id, order.get("status_message"),
+                order_id, self.tracker.rejection_reason(order_id),
             )
             # TODO: react — maybe retry, maybe alert, maybe halt the strategy
         elif status == "CANCELLED":
@@ -462,14 +466,35 @@ class CircuitBreaker:
 
 
 def write_config_py(base_dir):
-    """Generate config.py with risk parameters."""
+    """Generate config.py with risk parameters.
+
+    Calls load_dotenv() at module top so any caller importing config.py
+    (or modules that depend on it) gets .env-populated env vars regardless
+    of import order. Without this, auth.py / login.py and any module that
+    reads VORTEX_API_KEY at import time would race load_dotenv() and fail
+    silently with empty creds. The PyPI package name is `python-dotenv`
+    (NOT `dotenv` — that's a different, unrelated package).
+    """
     content = '''"""
 Configuration and defaults.
 
 All strategy and risk parameters defined in one place.
+
+Imports .env at module top so any downstream module reading os.environ
+at import time sees populated values, regardless of import order.
 """
 
 from dataclasses import dataclass
+
+# Load .env BEFORE anything else reads os.environ. python-dotenv is harmless
+# on container deployments (no .env present; load_dotenv silently does nothing).
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # python-dotenv isn\\'t installed (e.g., container build with no .env file).
+    # That\\'s fine — env vars are injected by the platform.
+    pass
 
 
 @dataclass
@@ -509,18 +534,23 @@ class Config:
 def write_requirements_txt(base_dir, deployment):
     """Generate requirements.txt.
 
-    python-dotenv is needed only for self-hosted (login.py reads .env). On the
-    container platform credentials are injected as real env vars, so dotenv is
-    just dead weight.
+    python-dotenv is included for both deployments: self-hosted needs it to
+    read .env; container doesn\\'t need .env but config.py has an
+    `try: from dotenv import load_dotenv` guard so the import being present
+    is harmless and keeps the import-order story identical across modes.
     """
-    dotenv_block = '''
-# Loads VORTEX_API_KEY / VORTEX_APPLICATION_ID from .env for login.py
-python-dotenv>=1.0.0
-''' if deployment != 'container' else ''
-
     content = '''# Core trading API — ticker-first surface (client.instruments, place_order(ticker=...))
+# 2.1.8 is the minimum that accepts ticker= on place_order / historical_candles /
+# get_order_margin and supports client.instruments. Newer 2.1.x releases also
+# require (limit, offset) positional args on client.orders() / client.trades();
+# OrderTracker handles both signatures via TypeError fallback.
 vortex-api>=2.1.8
-''' + dotenv_block + '''
+
+# Loads VORTEX_API_KEY / VORTEX_APPLICATION_ID from .env. The PyPI package is
+# `python-dotenv` (the import name is `dotenv`); a separate unrelated package
+# `dotenv` exists on PyPI — DO NOT depend on that one.
+python-dotenv>=1.0.0
+
 # Data processing
 pandas>=1.3.0
 numpy>=1.21.0
@@ -613,10 +643,12 @@ import json
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
-from vortex_api import VortexAPI
+# config.py calls load_dotenv() at its module top, so importing it first
+# guarantees .env is populated before we read os.environ — regardless of
+# whether the caller imports auth.py or config.py first.
+import config  # noqa: F401  (imported for its load_dotenv side-effect)
 
-load_dotenv()
+from vortex_api import VortexAPI
 
 API_KEY = os.environ["VORTEX_API_KEY"]
 APPLICATION_ID = os.environ["VORTEX_APPLICATION_ID"]
@@ -782,13 +814,29 @@ logger = logging.getLogger(__name__)
 
 
 class OrderTracker:
-    """Event-driven order tracker. See module docstring for design."""
+    """Split-authority order tracker.
 
-    TERMINAL = {"COMPLETED", "REJECTED", "CANCELLED"}
-    SUCCESS = {"COMPLETED"}
+    - Postback `data.status` is authoritative for STATUS TRANSITIONS (REST
+      orderbook can lag postbacks by tens of seconds on the same order).
+    - REST orderbook / tradebook are authoritative for FILL QUANTITIES and
+      avg traded price.
+    - Once terminal is recorded, a later non-terminal REST row must NOT
+      overwrite it (downgrade guard).
+    - Terminal-status detection uses substring match — broker may decorate
+      canonical tokens ("REJECTED_BY_RMS", "AMO_CANCELLED").
+    """
+
+    # Substring tokens. Broker may emit decorated forms; we normalise.
+    _TERMINAL_TOKENS = ("REJECTED", "CANCELLED", "EXECUTED", "COMPLETED")
+
+    TERMINAL = {"COMPLETED", "EXECUTED", "REJECTED", "CANCELLED"}
+    SUCCESS = {"COMPLETED", "EXECUTED"}
     REFRESH_ON_TYPES = {
         "order", "trade", "sl_trigger", "gtt_order", "position_conversion",
     }
+
+    # REST page size; raise if your account exceeds this many orders/day.
+    _PAGE_LIMIT = 500
 
     def __init__(self, client, debounce_seconds: float = 0.5):
         self._client = client
@@ -797,57 +845,141 @@ class OrderTracker:
         self._dirty = set()
         self._worker_running = False
         self._closed = False
-        self._orders = {}              # order_id -> orderbook row
-        self._trades = {}              # order_id -> list of tradebook rows
-        self._events = {}              # order_id -> threading.Event for wait()
-        self._notified_terminal = set()  # order_ids we have already fired on_terminal for
+        self._orders = {}             # order_id -> merged postback+REST row
+        self._trades = {}             # order_id -> list of tradebook rows
+        self._events = {}             # order_id -> threading.Event for wait()
+        self._notified_terminal = set()
 
-        # Public callback: callable(order_id: str, status: str) -> None.
-        # Set this AFTER calling initialize() and BEFORE placing orders.
-        # Fires exactly once per order_id when it first appears as terminal.
+        # callable(order_id: str, status: str) -> None.
+        # Set AFTER initialize() and BEFORE placing orders.
         self.on_terminal: Optional[Callable[[str, str], None]] = None
+
+    # ---- status / envelope helpers ----
+
+    @classmethod
+    def _terminal_token(cls, status):
+        """Substring-match a status string against canonical terminal tokens."""
+        if not status:
+            return None
+        s = status.upper()
+        for tok in cls._TERMINAL_TOKENS:
+            if tok in s:
+                return tok
+        return None
+
+    @classmethod
+    def _normalise_row(cls, row):
+        """Rewrite vendor-decorated terminal status to its canonical token;
+        preserve the original verbose form in `raw_status`.
+        Returns (row, terminal_token_or_None)."""
+        raw = row.get("status") or ""
+        tok = cls._terminal_token(raw)
+        if tok and raw != tok:
+            return {**row, "status": tok, "raw_status": raw}, tok
+        return row, tok
+
+    @staticmethod
+    def _orders_rows(book):
+        """Envelope key varies by endpoint:
+            client.orders()   -> {"orders": [...]}
+            client.holdings() -> {"data":   [...]}
+        Try the common keys and return the first list found."""
+        if not isinstance(book, dict):
+            return []
+        for key in ("orders", "data", "orderBook", "orderbook"):
+            v = book.get(key)
+            if isinstance(v, list):
+                return v
+        return []
+
+    @staticmethod
+    def _trades_rows(trades):
+        if not isinstance(trades, dict):
+            return []
+        for key in ("trades", "data", "tradeBook", "tradebook"):
+            v = trades.get(key)
+            if isinstance(v, list):
+                return v
+        return []
+
+    def _fetch_orderbook(self):
+        """Current vortex-api requires client.orders(limit, offset); fall back
+        to the no-args form for older releases."""
+        try:
+            return self._client.orders(limit=self._PAGE_LIMIT, offset=0) or {}
+        except TypeError:
+            return self._client.orders() or {}
+
+    def _fetch_tradebook(self):
+        try:
+            return self._client.trades(limit=self._PAGE_LIMIT, offset=0) or {}
+        except TypeError:
+            return self._client.trades() or {}
+
+    @staticmethod
+    def _rejection_reason(row):
+        """Rejection-reason field name varies by surface:
+            postback envelope    -> data.status_message
+            REST orderbook row   -> error_reason
+            place_order response -> message
+        Returns first non-empty value."""
+        return (
+            row.get("status_message")
+            or row.get("error_reason")
+            or row.get("message")
+        )
 
     # ---- one-time startup seeding ----
 
     def initialize(self):
-        """Seed the cache from today\\'s orderbook + tradebook WITHOUT firing
-        on_terminal for historical (already-terminal) orders.
-
-        Call this ONCE at startup, BEFORE setting on_terminal and BEFORE
-        placing any orders. Without it, on_terminal would fire on the first
-        refresh for every already-completed order from earlier in the day.
-        """
+        """Seed cache from today\\'s orderbook + tradebook WITHOUT firing
+        on_terminal for already-terminal orders. Call ONCE at startup,
+        BEFORE setting on_terminal and BEFORE placing orders."""
         try:
-            book = self._client.orders() or {}
-            trades = self._client.trades() or {}
+            book = self._fetch_orderbook()
+            trades = self._fetch_tradebook()
         except Exception as exc:
             logger.warning("OrderTracker.initialize() failed: %s", exc)
             return
         with self._lock:
-            for order in book.get("data") or []:
-                oid = order.get("order_id")
+            for row in self._orders_rows(book):
+                oid = row.get("order_id")
                 if not oid:
                     continue
-                self._orders[oid] = order
-                if order.get("status") in self.TERMINAL:
+                normalised, tok = self._normalise_row(row)
+                self._orders[oid] = normalised
+                if tok:
                     self._notified_terminal.add(oid)
             per_order = {}
-            for tr in trades.get("trades") or []:
+            for tr in self._trades_rows(trades):
                 oid = tr.get("order_id")
                 if oid:
                     per_order.setdefault(oid, []).append(tr)
             for oid, lst in per_order.items():
                 self._trades[oid] = lst
 
-    # ---- postback entry point (runs on the WS reader thread) ----
+    # ---- postback entry point (WS reader thread) ----
 
     def on_update(self, ws, msg):
-        """Wire to `wire.on_order_update`. Must NOT block."""
+        """Wire to wire.on_order_update. Must NOT block.
+
+        Fast-path: terminal `order` postbacks are mirrored into the cache
+        and fire on_terminal synchronously, BEFORE the REST refresh runs.
+        REST can be tens of seconds behind on rejections — waiting for it
+        would silently miss real terminal transitions.
+        """
         if msg.get("type") not in self.REFRESH_ON_TYPES:
             return
-        order_id = (msg.get("data") or {}).get("order_id")
+        payload = msg.get("data") or {}
+        order_id = payload.get("order_id")
         if not order_id:
             return
+
+        if msg.get("type") == "order":
+            normalised, tok = self._normalise_row(payload)
+            if tok:
+                self._record_terminal_from_postback(order_id, normalised, tok)
+
         with self._lock:
             if self._closed:
                 return
@@ -861,9 +993,30 @@ class OrderTracker:
                         name="OrderTracker-refresh",
                     ).start()
                 except Exception:
-                    # Reset on thread-start failure so the next postback retries.
                     self._worker_running = False
                     raise
+
+    def _record_terminal_from_postback(self, order_id, row, token):
+        """Merge terminal postback into cache; fire wait Events + on_terminal.
+        Runs on the WS reader thread — keep it fast. Idempotent."""
+        fire = None
+        with self._lock:
+            if order_id in self._notified_terminal:
+                return
+            existing = self._orders.get(order_id, {})
+            self._orders[order_id] = {**existing, **row}
+            self._notified_terminal.add(order_id)
+            ev = self._events.get(order_id)
+            if ev is not None:
+                ev.set()
+            fire = (order_id, token)
+
+        handler = self.on_terminal
+        if handler is not None and fire is not None:
+            try:
+                handler(*fire)
+            except Exception:
+                logger.exception("on_terminal handler raised for %s", fire[0])
 
     # ---- public read API ----
 
@@ -871,13 +1024,8 @@ class OrderTracker:
         """Block until terminal or `timeout` seconds. `timeout` is REQUIRED;
         pass float("inf") to wait forever.
 
-        Script / test primitive only. In a live strategy main loop, prefer
-        `on_terminal` — `wait()` blocks the calling thread.
-
-        Returns True iff COMPLETED. False on REJECTED / CANCELLED / timeout.
-        After a timeout, the order may still be live at the broker; check
-        `status()` or `cancel_and_wait()` before placing a replacement.
-        """
+        Script / test primitive. In a live strategy main loop use on_terminal.
+        After a timeout, the order may still be working at the broker."""
         with self._lock:
             order = self._orders.get(order_id)
             if order and order.get("status") in self.TERMINAL:
@@ -888,12 +1036,9 @@ class OrderTracker:
             return (self._orders.get(order_id) or {}).get("status") in self.SUCCESS
 
     def cancel_and_wait(self, order_id, timeout):
-        """Cancel and block until the broker confirms terminal state.
-
-        Returns the actual terminal status — usually CANCELLED, but could
-        be COMPLETED if a fill races the cancel. ALWAYS check the return
-        value before placing a replacement.
-        """
+        """Cancel and block until terminal confirmed. Returns the actual
+        terminal status — could be COMPLETED/EXECUTED if a fill races the
+        cancel. ALWAYS check before placing a replacement."""
         cur = self.status(order_id)
         if cur in self.TERMINAL:
             return cur
@@ -917,11 +1062,14 @@ class OrderTracker:
             return list(self._trades.get(order_id, []))
 
     def avg_fill_price(self, order_id):
+        """Orderbook traded_price (qty-weighted) preferred; fall back to
+        recomputing from tradebook rows. Note: orderbook uses traded_*,
+        tradebook uses trade_* — different field names for the same concept."""
         with self._lock:
-            order = self._orders.get(order_id)
-        if order:
-            qty = order.get("traded_quantity") or 0
-            px = order.get("traded_price") or 0
+            row = self._orders.get(order_id)
+        if row:
+            qty = row.get("traded_quantity") or 0
+            px = row.get("traded_price") or 0
             if qty > 0 and px > 0:
                 return float(px)
         with self._lock:
@@ -933,6 +1081,13 @@ class OrderTracker:
             (t.get("trade_price") or 0) * (t.get("trade_quantity") or 0) for t in trades
         )
         return notional / qty
+
+    def rejection_reason(self, order_id):
+        """Best-available rejection reason string. Field name varies by
+        surface — see _rejection_reason()."""
+        with self._lock:
+            row = self._orders.get(order_id, {})
+        return self._rejection_reason(row)
 
     def close(self):
         with self._lock:
@@ -948,10 +1103,9 @@ class OrderTracker:
                     self._worker_running = False
                     return
                 self._dirty.clear()
-
             try:
-                book = self._client.orders() or {}
-                trades = self._client.trades() or {}
+                book = self._fetch_orderbook()
+                trades = self._fetch_tradebook()
             except Exception as exc:
                 logger.warning("OrderTracker refresh failed: %s", exc)
                 with self._lock:
@@ -959,37 +1113,47 @@ class OrderTracker:
                         self._worker_running = False
                         return
                 continue
-
             self._apply(book, trades)
-            # No extra sleep — if new postbacks arrived during the API calls,
-            # the next iteration sees them in _dirty and refreshes immediately.
 
     def _apply(self, book, trades):
-        # Collect terminal transitions inside the lock; fire callbacks outside.
         fire = []
         with self._lock:
-            for order in book.get("data") or []:
-                oid = order.get("order_id")
+            for raw_row in self._orders_rows(book):
+                oid = raw_row.get("order_id")
                 if not oid:
                     continue
-                self._orders[oid] = order
-                status = order.get("status")
-                if status in self.TERMINAL and oid not in self._notified_terminal:
+                row, tok = self._normalise_row(raw_row)
+
+                # DOWNGRADE GUARD: if a postback already established
+                # terminal and REST is still lagging (non-terminal), merge
+                # fill data but keep the terminal status.
+                if oid in self._notified_terminal and tok is None:
+                    existing = self._orders.get(oid, {})
+                    fields_without_status = {
+                        k: v for k, v in row.items() if k != "status"
+                    }
+                    self._orders[oid] = {**existing, **fields_without_status}
+                    continue
+
+                existing = self._orders.get(oid, {})
+                self._orders[oid] = {**existing, **row}
+
+                if tok and oid not in self._notified_terminal:
                     self._notified_terminal.add(oid)
                     ev = self._events.get(oid)
                     if ev is not None:
                         ev.set()
-                    fire.append((oid, status))
+                    fire.append((oid, tok))
 
             per_order = {}
-            for tr in trades.get("trades") or []:
+            for tr in self._trades_rows(trades):
                 oid = tr.get("order_id")
                 if oid:
                     per_order.setdefault(oid, []).append(tr)
             for oid, lst in per_order.items():
                 self._trades[oid] = lst
 
-        # Outside the lock so user code in on_terminal can\\'t deadlock us.
+        # Outside lock so user code in on_terminal can\\'t deadlock us.
         handler = self.on_terminal
         if handler is not None:
             for oid, status in fire:

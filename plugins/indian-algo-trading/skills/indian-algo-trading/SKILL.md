@@ -151,9 +151,9 @@ Why: `auth_token` (the `?auth=...` redirect param) and `access_token` (the long-
 
 Does **not** apply to the container platform — there `VORTEX_ACCESS_TOKEN` is injected at runtime, `main.py` uses zero-arg `VortexAPI()`, and `login.py`/`auth.py` would be dead code that breaks at runtime.
 
-### 9. Order updates: postback is a *signal*, orderbook is the *truth*. Never sleep-poll.
+### 9. Order updates have split authority across surfaces. Never sleep-poll.
 
-`VortexFeed.on_order_update` is the only way to learn an order changed. Connect the feed *before* any `place_order` so the first push isn't lost. The callback fires for **five** envelope types — all signal that state changed for some `order_id`:
+`VortexFeed.on_order_update` is the only way to learn an order changed in real time. Connect the feed *before* any `place_order` so the first push isn't lost. The callback fires for **five** envelope types — all signal that state changed for some `order_id`:
 
 | `msg["type"]` | What changed |
 |---|---|
@@ -163,15 +163,21 @@ Does **not** apply to the container platform — there `VORTEX_ACCESS_TOKEN` is 
 | `"gtt_order"` | GTT placement / trigger lifecycle |
 | `"position_conversion"` | MIS ↔ CNC conversion |
 
-**Do NOT parse `msg["data"]` as the source of truth for order state.** The orderbook (`client.orders()`) and tradebook (`client.trades()`) are the canonical state. On every postback, refresh from those APIs — but **coalesce** refreshes (one large order can fire dozens of trade postbacks; without coalescing you'll hit the REST rate limit).
+**Authority is split between surfaces — this matters because the REST orderbook can lag postbacks by tens of seconds on the same order:**
 
-The coalescing rule: first postback → wait 500 ms → call `client.orders()` and `client.trades()` once → update local state → if more postbacks arrived during the API calls, refresh immediately (no further wait). Postbacks during the 500 ms window accumulate for free.
+- **Postback `data.status`** — authoritative for **status transitions**. WS pushes arrive within ms. If a postback says terminal (REJECTED / COMPLETED / CANCELLED), believe it immediately and fire your `on_terminal` callback. Don't wait for REST.
+- **`client.orders()` / `client.trades()`** — authoritative for **fill quantities, traded_price, and other fields the postback can drop or lag**. Refresh from these on every postback (coalesced 500 ms debounce) to fold in the canonical fill data.
+- **Downgrade guard**: once terminal is recorded for an order_id (from a postback), a later non-terminal REST row for that same order_id is **stale** — merge fill fields but DO NOT overwrite the status. `OrderTracker._apply` does this.
 
-**Do NOT poll** `client.orders()` / `client.order_history()` / `client.trades()` on a sleep-loop interval. Polling is sleep-loop driven. Refresh-on-postback is event-driven — API is called *only* when something actually changed.
+Coalescing rule: first postback → 500 ms debounce → one `orders()` + `trades()` call → update local state → if new postbacks landed during the REST calls, refresh again immediately (no further wait). Postbacks during the 500 ms window accumulate for free, so a many-fill order doesn't trip the REST rate limit.
 
-**Order outcomes are events, not return values.** Live strategies wire `tracker.on_terminal = strategy.on_order_terminal` and receive `(order_id, status)` callbacks for every terminal transition — even if no thread was blocked waiting. **Do NOT call `tracker.wait()` inside the strategy main loop** (`next(tick)` or signal handlers); it blocks the loop and a far-from-market limit will block it for hours. `wait()` is the script / test / `cancel_and_wait()` primitive; its `timeout` is required (pass `float("inf")` for "forever"). Call `tracker.initialize()` once at startup before placing any orders so `on_terminal` doesn't fire spuriously for orders that were already terminal earlier in the day.
+**Do NOT poll** `client.orders()` / `client.order_history()` / `client.trades()` on a sleep-loop. Polling is timer-driven. Refresh-on-postback is event-driven — the REST API is called *only* when a postback indicates something changed.
 
-Terminal `order` statuses: `"COMPLETED"`, `"REJECTED"`, `"CANCELLED"`.
+**Order outcomes are events, not return values.** Live strategies wire `tracker.on_terminal = strategy.on_order_terminal` and receive `(order_id, status)` callbacks for every terminal transition — even if no thread was blocked waiting. **Do NOT call `tracker.wait()` inside the strategy main loop** (`next(tick)` or signal handlers); `wait()` is the script / test / `cancel_and_wait()` primitive only. Its `timeout` is required (pass `float("inf")` to wait forever). Call `tracker.initialize()` once at startup before placing any orders so `on_terminal` doesn't fire spuriously for orders that were already terminal earlier in the day.
+
+**Terminal-status detection is substring-based**, not strict set membership. Brokers may decorate canonical tokens (`REJECTED_BY_RMS`, `AMO_CANCELLED`, `EXECUTED_PARTIAL`); normalise via substring match against `("REJECTED", "CANCELLED", "EXECUTED", "COMPLETED")`. Canonical tokens: `"COMPLETED"`/`"EXECUTED"` (same state — postback uses COMPLETED, orderbook uses EXECUTED), `"REJECTED"`, `"CANCELLED"`. The reference `OrderTracker._terminal_token()` handles this.
+
+**Rejection reason field name varies by surface** — postback envelope uses `status_message`, REST orderbook row uses `error_reason`, `place_order` response uses `message`. Always check all three (or use `tracker.rejection_reason(order_id)` which does).
 
 ```python
 # Minimal sketch — use OrderTracker (references/code-quality.md) in real strategies.

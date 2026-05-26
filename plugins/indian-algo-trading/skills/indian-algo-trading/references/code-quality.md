@@ -621,38 +621,52 @@ logger = logging.getLogger(__name__)
 
 class OrderTracker:
     """
-    Postback-driven order tracker that refreshes from orderbook + tradebook.
+    Postback-driven order tracker with split authority across surfaces.
 
-    Design (full rationale in SKILL.md Critical Rule 9):
+    Authority model (matters — REST orderbook can lag postbacks by tens of
+    seconds on the same broker; see SKILL.md Critical Rule 9):
 
-      - The orderbook (`client.orders()`) and tradebook (`client.trades()`) are
-        the canonical source of truth. The postback is a SIGNAL that something
-        changed for an order_id; we never trust `msg["data"]` as the new state.
-      - Postbacks are coalesced into a 500 ms debounce window so one big order
-        with many fills doesn't melt the REST rate limit.
-      - One callback (`on_terminal`) fires when an order_id first reaches a
-        terminal status — regardless of who, if anyone, is `wait()`ing on it.
-        Live strategies wire this and let order outcomes flow as events.
-      - `wait()` exists for tests, one-shot scripts, and `cancel_and_wait`.
-        It is NOT the right primitive inside a strategy main loop — see
-        on_terminal. Its `timeout` argument is required (no default), so
-        the caller is forced to pick consciously.
+      - **Postback `data.status`** — authoritative for STATUS TRANSITIONS.
+        WS pushes arrive within ms. If a postback says terminal (REJECTED /
+        CANCELLED / COMPLETED), believe it immediately. Do not wait for REST.
+      - **REST orderbook / tradebook** — authoritative for FILL QUANTITIES,
+        traded_price, avg fill price, and other fields the postback can drop
+        or lag. Refresh on every postback (coalesced 500 ms debounce) to fold
+        these in.
+      - **Downgrade guard**: once a terminal status is recorded, a later
+        non-terminal REST row must NOT overwrite it (REST is stale; postback
+        was already correct).
 
-    Threading: `on_terminal` fires on the refresh worker thread, NOT the
-    strategy main thread. If your handler mutates state shared with the main
-    loop (e.g., position tracking), use a lock or queue it for the main loop
-    to drain. Don't do REST calls or other slow work inside the handler —
-    it blocks the refresh worker.
+    Terminal-status detection uses **substring match** against canonical
+    tokens (`COMPLETED`, `EXECUTED`, `REJECTED`, `CANCELLED`). Brokers may
+    decorate them (`REJECTED_BY_RMS`, `AMO_CANCELLED`); we normalise to the
+    canonical token and preserve the original in `raw_status`.
+
+    `on_terminal` fires once per `order_id` when it first reaches terminal,
+    via either the postback fast-path (sync, on the WS thread) or the REST
+    refresh (on the worker thread). Strategy code: serialize state mutations
+    with a lock or queue events.
+
+    `wait()` exists for tests, one-shot scripts, and `cancel_and_wait`. NOT
+    for the strategy main loop; its `timeout` is required (no default).
     """
 
-    TERMINAL = {"COMPLETED", "REJECTED", "CANCELLED"}
-    SUCCESS = {"COMPLETED"}
+    # Canonical terminal tokens. Substring-matched so vendor-decorated forms
+    # (REJECTED_BY_RMS, AMO_CANCELLED, EXECUTED_PARTIAL_AMENDED, ...) all
+    # normalise correctly. COMPLETED and EXECUTED are the same state under
+    # two names — postback uses COMPLETED, client.orders() uses EXECUTED.
+    _TERMINAL_TOKENS = ("REJECTED", "CANCELLED", "EXECUTED", "COMPLETED")
 
-    # The five envelope types VortexFeed.on_order_update can deliver. Each one
-    # signals state changed for some order_id, so refresh on all of them.
+    TERMINAL = {"COMPLETED", "EXECUTED", "REJECTED", "CANCELLED"}
+    SUCCESS = {"COMPLETED", "EXECUTED"}
+
     REFRESH_ON_TYPES = {
         "order", "trade", "sl_trigger", "gtt_order", "position_conversion",
     }
+
+    # REST page size for orderbook / tradebook fetches. Retail accounts almost
+    # never exceed this in a session; raise if you trade higher volume.
+    _PAGE_LIMIT = 500
 
     def __init__(self, client, debounce_seconds: float = 0.5) -> None:
         self._client = client
@@ -663,53 +677,139 @@ class OrderTracker:
         self._worker_running = False
         self._closed = False
 
-        # State populated from REST refreshes — NOT from postback payloads.
+        # Merged state from postbacks + REST refreshes. Terminal status comes
+        # from whichever surface saw it first; fill quantities / prices come
+        # from the orderbook refresh.
         self._orders: dict[str, dict] = {}
         self._trades: dict[str, list] = {}
 
-        # For wait(): per-order Event set when the order reaches terminal.
         self._events: dict[str, threading.Event] = {}
-
-        # For on_terminal: order_ids we've already fired the callback for.
-        # Prevents duplicate fires on subsequent refreshes.
         self._notified_terminal: set[str] = set()
 
-        # Public: callable(order_id: str, status: str) -> None. Set this once
-        # at startup (after initialize()) and the worker will fire it for
-        # every terminal transition from then on. Runs on the worker thread.
+        # callable(order_id: str, status: str) -> None.
+        # Set BEFORE placing orders. Fires once per order_id.
         self.on_terminal: Optional[Callable[[str, str], None]] = None
+
+    # ------- status / envelope helpers -------
+
+    @classmethod
+    def _terminal_token(cls, status: Optional[str]) -> Optional[str]:
+        """Substring-match a status string against canonical terminal tokens.
+
+        Returns the canonical token (`"REJECTED"`, `"CANCELLED"`, etc.) or
+        `None` if `status` is non-terminal. Handles vendor-decorated forms
+        like `"REJECTED_BY_RMS"`, `"AMO_CANCELLED"`, `"EXECUTED_PARTIAL"`.
+        """
+        if not status:
+            return None
+        s = status.upper()
+        for tok in cls._TERMINAL_TOKENS:
+            if tok in s:
+                return tok
+        return None
+
+    @classmethod
+    def _normalise_row(cls, row: dict) -> "tuple[dict, Optional[str]]":
+        """If `row.status` is a terminal decorated form, rewrite `status` to
+        the canonical token and preserve the original in `raw_status`.
+
+        Returns (possibly-rewritten row, canonical token or None).
+        """
+        raw = row.get("status") or ""
+        tok = cls._terminal_token(raw)
+        if tok and raw != tok:
+            return {**row, "status": tok, "raw_status": raw}, tok
+        return row, tok
+
+    @staticmethod
+    def _orders_rows(book: dict) -> list:
+        """Endpoint response envelope varies by API:
+
+            client.orders()    → {"orders": [...]}
+            client.holdings()  → {"data":   [...]}
+            client.trades()    → {"trades": [...]}
+
+        Try the common keys in order and return the first list found.
+        """
+        if not isinstance(book, dict):
+            return []
+        for key in ("orders", "data", "orderBook", "orderbook"):
+            v = book.get(key)
+            if isinstance(v, list):
+                return v
+        return []
+
+    @staticmethod
+    def _trades_rows(trades: dict) -> list:
+        if not isinstance(trades, dict):
+            return []
+        for key in ("trades", "data", "tradeBook", "tradebook"):
+            v = trades.get(key)
+            if isinstance(v, list):
+                return v
+        return []
+
+    def _fetch_orderbook(self) -> dict:
+        """On current vortex-api, `client.orders(limit, offset)` are required
+        positional args. On older releases the no-args form worked. Try the
+        new form first, fall back on TypeError for forward / backward compat.
+        """
+        try:
+            return self._client.orders(limit=self._PAGE_LIMIT, offset=0) or {}
+        except TypeError:
+            return self._client.orders() or {}
+
+    def _fetch_tradebook(self) -> dict:
+        try:
+            return self._client.trades(limit=self._PAGE_LIMIT, offset=0) or {}
+        except TypeError:
+            return self._client.trades() or {}
+
+    @staticmethod
+    def _rejection_reason(row: dict) -> Optional[str]:
+        """The rejection-reason field is named differently across surfaces:
+
+            postback envelope    →  data.status_message
+            REST orderbook row   →  error_reason
+            place_order response →  message
+
+        Returns the first non-empty value across the three.
+        """
+        return (
+            row.get("status_message")
+            or row.get("error_reason")
+            or row.get("message")
+        )
 
     # ------- one-time startup seeding -------
 
     def initialize(self) -> None:
-        """Seed the cache from the current orderbook + tradebook WITHOUT
-        firing on_terminal for historical orders.
+        """Seed cache from today's orderbook + tradebook WITHOUT firing
+        `on_terminal` for orders that are already terminal at startup.
 
-        Call this once at startup, BEFORE setting `on_terminal` and BEFORE
-        placing any orders. Without it, the first refresh after startup
-        would treat every already-terminal order from earlier in the day
-        as a fresh transition and fire your callback for each one.
+        Call ONCE at startup, BEFORE setting `on_terminal` and BEFORE placing
+        orders. Otherwise the first refresh fires `on_terminal` for every
+        already-completed order from earlier in the day.
         """
         try:
-            book = self._client.orders() or {}
-            trades = self._client.trades() or {}
+            book = self._fetch_orderbook()
+            trades = self._fetch_tradebook()
         except Exception as exc:
             logger.warning("OrderTracker.initialize() failed: %s", exc)
             return
 
         with self._lock:
-            for order in book.get("data") or []:
-                oid = order.get("order_id")
+            for row in self._orders_rows(book):
+                oid = row.get("order_id")
                 if not oid:
                     continue
-                self._orders[oid] = order
-                if order.get("status") in self.TERMINAL:
-                    # Mark as already-notified so on_terminal won't fire later
-                    # for orders that were terminal before we started watching.
+                normalised, tok = self._normalise_row(row)
+                self._orders[oid] = normalised
+                if tok:
                     self._notified_terminal.add(oid)
 
             per_order: dict[str, list] = {}
-            for tr in trades.get("trades") or []:
+            for tr in self._trades_rows(trades):
                 oid = tr.get("order_id")
                 if oid:
                     per_order.setdefault(oid, []).append(tr)
@@ -719,12 +819,30 @@ class OrderTracker:
     # ------- postback entry point (WS reader thread) -------
 
     def on_update(self, ws, msg: dict) -> None:
-        """Wire to `wire.on_order_update`. Must NOT block (runs on WS thread)."""
+        """Wire to `wire.on_order_update`. Must NOT block (runs on WS thread).
+
+        Fast-path: if this is an `order` postback whose `status` is already
+        terminal, mirror it into the cache and fire `on_terminal` synchronously.
+        The REST orderbook can be tens of seconds behind a postback on real
+        rejections — waiting for it would silently miss terminal transitions.
+        """
         if msg.get("type") not in self.REFRESH_ON_TYPES:
             return
-        order_id = (msg.get("data") or {}).get("order_id")
+        payload = msg.get("data") or {}
+        order_id = payload.get("order_id")
         if not order_id:
             return
+
+        # Fast path for terminal `order` postbacks. The REST refresh still
+        # runs (see schedule below) to populate fill quantities; we just
+        # don't wait for it to learn the terminal state.
+        if msg.get("type") == "order":
+            normalised, tok = self._normalise_row(payload)
+            if tok:
+                self._record_terminal_from_postback(order_id, normalised, tok)
+
+        # Schedule a coalesced REST refresh regardless — orderbook is still
+        # authoritative for traded_quantity / traded_price after a fill.
         with self._lock:
             if self._closed:
                 return
@@ -738,23 +856,45 @@ class OrderTracker:
                         name="OrderTracker-refresh",
                     ).start()
                 except Exception:
-                    # Reset on thread-start failure so the next postback retries.
                     self._worker_running = False
                     raise
+
+    def _record_terminal_from_postback(
+        self, order_id: str, row: dict, token: str
+    ) -> None:
+        """Merge a terminal postback into the cache; fire wait Events + on_terminal.
+
+        Runs on the WS reader thread — keep it fast (no REST, no slow user code).
+        Idempotent: a second terminal postback for the same order_id is a no-op.
+        """
+        fire = None
+        with self._lock:
+            if order_id in self._notified_terminal:
+                return
+            existing = self._orders.get(order_id, {})
+            # Postback payload layered on top of prior state; raw_status preserved.
+            self._orders[order_id] = {**existing, **row}
+            self._notified_terminal.add(order_id)
+            ev = self._events.get(order_id)
+            if ev is not None:
+                ev.set()
+            fire = (order_id, token)
+
+        handler = self.on_terminal
+        if handler is not None and fire is not None:
+            try:
+                handler(*fire)
+            except Exception:
+                logger.exception("on_terminal handler raised for %s", fire[0])
 
     # ------- public read API -------
 
     def wait(self, order_id: str, timeout: float) -> bool:
-        """Block until terminal or `timeout` seconds elapse.
+        """Block until terminal or `timeout` seconds. `timeout` is REQUIRED;
+        pass `float("inf")` to wait forever.
 
-        `timeout` is REQUIRED — pass `float("inf")` to wait forever.
-
-        This is the script / test primitive. In a live strategy main loop,
-        prefer `on_terminal` — `wait()` blocks the calling thread and a
-        rest-orders-far-from-market case will block it for hours.
-
-        Returns True iff the order ended in SUCCESS (COMPLETED). False on
-        REJECTED / CANCELLED / timeout. After a timeout, check `status()`
+        Script / test primitive. In a live strategy main loop use `on_terminal`.
+        Returns True iff status is in SUCCESS. After a timeout, check `status()`
         — the order may still be working at the broker.
         """
         with self._lock:
@@ -766,16 +906,12 @@ class OrderTracker:
         with self._lock:
             return (self._orders.get(order_id) or {}).get("status") in self.SUCCESS
 
-    def cancel_and_wait(self, order_id: str, timeout: float) -> Optional[str]:
-        """Cancel the order and block until the broker confirms a terminal state.
-
-        Returns the actual terminal status — usually CANCELLED, but can be
-        COMPLETED if a fill races the cancel, or REJECTED if the cancel
-        request itself was rejected. Strategy code MUST check the return
-        value before placing a replacement; never assume the order is dead.
-
-        Safe to call when the order is already terminal — no cancel is sent
-        and the existing status is returned.
+    def cancel_and_wait(
+        self, order_id: str, timeout: float
+    ) -> Optional[str]:
+        """Cancel and block until terminal state confirmed. Returns the actual
+        terminal status — `CANCELLED`, or `COMPLETED`/`EXECUTED` if a fill
+        raced the cancel. ALWAYS check before placing a replacement.
         """
         cur = self.status(order_id)
         if cur in self.TERMINAL:
@@ -783,8 +919,6 @@ class OrderTracker:
         try:
             self._client.cancel_order(order_id=order_id)
         except Exception as exc:
-            # Cancel rejected (already filled, already cancelled, etc.) — fine,
-            # the refresh will tell us the real state.
             logger.info("cancel_order(%s) raised: %s", order_id, exc)
         self.wait(order_id, timeout=timeout)
         return self.status(order_id)
@@ -794,22 +928,28 @@ class OrderTracker:
             return (self._orders.get(order_id) or {}).get("status")
 
     def order(self, order_id: str) -> dict:
-        """Latest orderbook row for this order — status, qty, prices, etc."""
+        """Latest merged row for this order (postback + orderbook fields)."""
         with self._lock:
             return dict(self._orders.get(order_id, {}))
 
     def fills(self, order_id: str) -> list:
-        """All tradebook rows we've seen for this order_id."""
+        """All tradebook rows seen for this order_id."""
         with self._lock:
             return list(self._trades.get(order_id, []))
 
     def avg_fill_price(self, order_id: str) -> Optional[float]:
-        """Prefer orderbook's avg traded_price; fall back to tradebook math."""
+        """Quantity-weighted average fill price.
+
+        Prefers `client.orders()`'s `traded_price` (already qty-weighted).
+        Falls back to recomputing from tradebook rows. Note the field-name
+        difference between surfaces — orderbook uses `traded_*`, tradebook
+        uses `trade_*`.
+        """
         with self._lock:
-            order = self._orders.get(order_id)
-        if order:
-            qty = order.get("traded_quantity") or 0
-            px = order.get("traded_price") or 0
+            row = self._orders.get(order_id)
+        if row:
+            qty = row.get("traded_quantity") or 0
+            px = row.get("traded_price") or 0
             if qty > 0 and px > 0:
                 return float(px)
         with self._lock:
@@ -823,8 +963,18 @@ class OrderTracker:
         )
         return notional / qty
 
+    def rejection_reason(self, order_id: str) -> Optional[str]:
+        """Most informative rejection-reason string we've seen for this
+        order. The field name varies by surface: postback uses
+        `status_message`, REST uses `error_reason`, place_order response
+        uses `message`. Returns the first non-empty one.
+        """
+        with self._lock:
+            row = self._orders.get(order_id, {})
+        return self._rejection_reason(row)
+
     def close(self) -> None:
-        """Stop accepting further refreshes. Pending Events are NOT released."""
+        """Stop accepting further refreshes."""
         with self._lock:
             self._closed = True
 
@@ -840,8 +990,8 @@ class OrderTracker:
                 self._dirty.clear()
 
             try:
-                book = self._client.orders() or {}
-                trades = self._client.trades() or {}
+                book = self._fetch_orderbook()
+                trades = self._fetch_tradebook()
             except Exception as exc:
                 logger.warning("OrderTracker refresh failed: %s", exc)
                 with self._lock:
@@ -855,31 +1005,46 @@ class OrderTracker:
             # the next iteration sees them in _dirty and refreshes immediately.
 
     def _apply(self, book: dict, trades: dict) -> None:
-        # Collect terminal transitions inside the lock; fire callbacks outside.
         fire: list[tuple[str, str]] = []
         with self._lock:
-            for order in book.get("data") or []:
-                oid = order.get("order_id")
+            for raw_row in self._orders_rows(book):
+                oid = raw_row.get("order_id")
                 if not oid:
                     continue
-                self._orders[oid] = order
-                status = order.get("status")
-                if status in self.TERMINAL and oid not in self._notified_terminal:
+                row, tok = self._normalise_row(raw_row)
+
+                # DOWNGRADE GUARD: REST orderbook can return PENDING /
+                # working status for tens of seconds AFTER a postback
+                # already pushed the terminal state. Don't let stale REST
+                # data clobber a terminal status the postback established.
+                if oid in self._notified_terminal and tok is None:
+                    existing = self._orders.get(oid, {})
+                    fields_without_status = {
+                        k: v for k, v in row.items() if k != "status"
+                    }
+                    self._orders[oid] = {**existing, **fields_without_status}
+                    continue
+
+                # Normal path: merge (preserve any earlier fields like
+                # raw_status from the postback) and store.
+                existing = self._orders.get(oid, {})
+                self._orders[oid] = {**existing, **row}
+
+                if tok and oid not in self._notified_terminal:
                     self._notified_terminal.add(oid)
                     ev = self._events.get(oid)
                     if ev is not None:
                         ev.set()
-                    fire.append((oid, status))
+                    fire.append((oid, tok))
 
             per_order: dict[str, list] = {}
-            for tr in trades.get("trades") or []:
+            for tr in self._trades_rows(trades):
                 oid = tr.get("order_id")
                 if oid:
                     per_order.setdefault(oid, []).append(tr)
             for oid, lst in per_order.items():
                 self._trades[oid] = lst
 
-        # Outside the lock so user code in on_terminal can't deadlock us.
         handler = self.on_terminal
         if handler is not None:
             for oid, status in fire:

@@ -20,6 +20,36 @@ vortex-api>=2.1.8
 
 > **2.1.8 is the version that introduced the ticker-first surface** (`client.instruments`, `place_order(ticker=...)`, `wire.subscribe(ticker=...)`, tick-level `ticker` field). Every example in this document uses that surface. If you must run on an older SDK, the legacy `exchange`+`token` form still works but emits `FutureWarning` and will be removed in a future release.
 
+### SDK signature changes — observed in field testing
+
+Several `vortex-api` calls have signature changes that aren't always reflected in older docs. The reference `OrderTracker` defensively handles them, but if you call these directly:
+
+| Call | Status |
+|---|---|
+| `client.place_order(...)` | `disclosed_quantity` is **REQUIRED** (pass `0` if no iceberg). Omitting it raises `TypeError`. |
+| `client.orders(limit, offset)` | **Both REQUIRED positional args.** No-args form raises `TypeError`. Try `limit=500, offset=0` first; the OrderTracker falls back to no-args on `TypeError` for older SDKs. |
+| `client.trades(limit, offset)` | Same as `orders()`: REQUIRED positional, with the same fallback approach. |
+| `client.get_order_margin(...)` response | **Flat shape**, not nested: `{"status": "success", "required_margin": x, "available_margin": y}`. Older examples that read `response["data"]["margin"]` will `KeyError`. |
+
+### Endpoint response envelope keys
+
+The top-level key that holds the row list **varies by endpoint** — don't assume `"data"`:
+
+| Endpoint | Top-level key | Shape |
+|---|---|---|
+| `client.orders()` | **`"orders"`** (list) | `{"status": "success", "orders": [row, row, ...], "metadata": {...}}` |
+| `client.trades()` | **`"trades"`** (list) | `{"status": "success", "trades": [row, row, ...]}` |
+| `client.order_history(order_id)` | `"data"` (list) | `{"data": [state, state, ...]}` |
+| `client.holdings()` | `"data"` (list) | `{"status": "success", "data": [holding, holding, ...]}` |
+| `client.positions()` | `"data"` (object) | `{"status": "success", "data": {"net": [...], "day": [...]}}` |
+| `client.funds()` | `"data"` (object, sometimes `{}`) | `{"data": {"equity": {...}, ...}}` — can be empty on some accounts |
+| `client.gtt_orders()` (GTT order book) | `"data"` (list) | `{"status": "success", "data": [trigger, trigger, ...]}` |
+| `client.place_order()` | `"data"` (single object) | `{"status": "success", "data": {"order_id": "..."}}` |
+| `client.get_order_margin(...)` | **flat** (no row list) | `{"status": "success", "initial_margin": x, "required_margin": y, "available_margin": z}` |
+| `client.historical_candles(...)` | **flat OHLCV arrays** | `{"s": "ok", "t": [...], "o": [...], "h": [...], "l": [...], "c": [...], "v": [...]}` — TradingView-style, single-letter keys, parallel arrays indexed by candle |
+
+`OrderTracker._orders_rows()` / `_trades_rows()` try the right keys with fallback chains. For endpoints whose response shape is flat or different (margin, historical), read the documented fields directly.
+
 ---
 
 ## Deployment Modes
@@ -179,6 +209,24 @@ client.instruments.refresh()
 
 `Instrument` exposes every column from the master file as a typed attribute: `ticker`, `token`, `exchange`, `symbol`, `instrument_name`, `series`, `expiry_date`, `isin`, `option_type`, `strike_price`, `tick`, `lot_size`, `eligibility`, `name`, `last_trading_date`, `asm_gsm_stage`. Don't index into a CSV; just read the attribute.
 
+#### Field-format quirks observed in field testing
+
+- **`expiry_date` format differs across surfaces for the same contract.** Master CSV: `"20260529"` (zero-padded `YYYYMMDD`, no separator). REST orderbook row: `"2026-05-29"` (ISO). Postback envelope: `"29May2026"`. **Recommendation: don't parse the master form — `YYYYMMDD` is lexicographically sortable as a string**, so filter and sort with plain string compare. Avoids the whole parser-zoo bug class.
+- **Futures rows use `option_type='XX'`** (or sometimes `'  '` — two spaces), **not** `None`/`""`. A naive `option_type in (None, "")` filter for futures misses them. Strike price is `0` or `-1` for futures. The robust check:
+  ```python
+  def is_future(inst):
+      return (inst.option_type or "").strip().upper() in ("", "XX")
+          and inst.instrument_name in ("FUTSTK", "FUTIDX", "FUTCOM", "FUTCUR")
+  ```
+- **Options use `option_type='CE'` or `'PE'`** — same field, different vocabulary depending on whether the row is a future or an option. Combined filter for an option chain on a given underlying:
+  ```python
+  chain = client.instruments.filter(
+      lambda i: i.exchange == "NSE_FO"
+                and i.symbol == "NIFTY"
+                and i.option_type in ("CE", "PE")
+  )
+  ```
+
 ### Lot Size & Tick Size
 
 Both come straight off the `Instrument` object — never assume, never hardcode:
@@ -232,7 +280,7 @@ print(f"Order ID: {order.get('data', {}).get('order_id')}")
 | quantity           | int   | Yes      | Number of shares/units                                                                                           |
 | price              | float | Yes      | Limit price; 0 for market orders                                                                                 |
 | trigger_price      | float | Yes      | Trigger for stop-loss orders; 0 otherwise                                                                        |
-| disclosed_quantity | int   | No       | Partial disclosure for iceberg orders                                                                            |
+| disclosed_quantity | int   | **Yes**  | Partial disclosure for iceberg orders. Pass `0` if no iceberg — the SDK raises `TypeError` if this is omitted. |
 | validity           | str   | Yes      | DAY, IOC, or AMO                                                                                                 |
 
 ### Order Types
@@ -320,7 +368,9 @@ except requests.exceptions.HTTPError as e:
 ### Margin Check Before Order
 
 ```python
-# Calculate required margin before placing order
+# get_order_margin returns BOTH required and available margin in one call.
+# Response shape is FLAT (not nested under "data"):
+#   {"status": "success", "required_margin": x, "available_margin": y}
 margin = client.get_order_margin(
     ticker="NSE:RELIANCE",
     transaction_type=Vc.TransactionSides.BUY,
@@ -331,15 +381,17 @@ margin = client.get_order_margin(
     mode=Vc.OrderMarginModes.NEW_ORDER,
 )
 
-available_margin = client.funds().get("data", {}).get("equity", {}).get("margin_available")
-required = margin.get("data", {}).get("margin")
+required  = margin.get("required_margin", 0)
+available = margin.get("available_margin", 0)
 
-if required > available_margin:
-    print(f"Insufficient margin: need {required}, have {available_margin}")
-    # Do not place order
+if required > available:
+    print(f"Insufficient margin: need {required}, have {available}")
+    # Do not place the order
 else:
     order = client.place_order(...)
 ```
+
+> **Use `get_order_margin`'s `available_margin` as the canonical "do I have enough" check.** Don't double-call `client.funds()` for this — in field testing, `funds()` returned `{}` on some test accounts (no `data` key, no buckets), which would `KeyError` if you tried to read `funds().data.equity.margin_available`. `get_order_margin` gets you both numbers in one round-trip with a stable shape.
 
 ---
 
@@ -969,17 +1021,30 @@ else:
 
 ### Order Rejection
 
+The rejection-reason field name **varies across the three surfaces** that can report a rejection for the same `order_id`:
+
+| Surface | Field |
+|---|---|
+| Postback envelope (`wire.on_order_update` → `msg["data"]`) | `status_message` |
+| REST orderbook row (`client.orders()`) | `error_reason` |
+| `place_order()` synchronous response | `message` |
+
+Always use the chained fallback (or `OrderTracker.rejection_reason(order_id)`, which does this for you):
+
 ```python
+def rejection_reason(row):
+    return row.get("status_message") or row.get("error_reason") or row.get("message")
+
 order = client.place_order(...)
 
 if order.get("status") == "error":
-    error_msg = order.get("message")
-    print(f"Order rejected: {error_msg}")
-    # Handle rejection: invalid quantity, insufficient margin, etc.
+    print(f"Order rejected: {rejection_reason(order)}")
 elif order.get("status") == "success":
-    order_id = order.get("data", {}).get("order_id")
+    order_id = order["data"]["order_id"]
     print(f"Order accepted: {order_id}")
 ```
+
+For rejections that arrive later (after `place_order` returned success but the RMS rejected during execution), the strategy's `on_order_terminal(order_id, status)` callback should also log `tracker.rejection_reason(order_id)`. The reference scaffolder generates this in `strategy.py`.
 
 ### API Errors
 
