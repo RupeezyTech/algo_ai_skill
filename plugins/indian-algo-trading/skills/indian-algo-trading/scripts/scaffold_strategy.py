@@ -15,11 +15,12 @@ Usage:
     # Backtest-only skeleton
     python scaffold_strategy.py backtest_v2 --type backtest
 
-Output structure (self-hosted):
+Output structure (live, self-hosted):
     my_strategy/
-        main.py              # Reads cached token via auth.get_client()
+        main.py              # Wires client + VortexFeed + OrderTracker; runs strategy
         login.py             # Loopback SSO login (run once per session)
         auth.py              # Credential helpers (get_client / save_token)
+        order_tracker.py     # Postback-driven order tracker (see SKILL.md Rule 9)
         strategy.py
         risk_manager.py
         guardrails.py
@@ -30,9 +31,14 @@ Output structure (self-hosted):
             __init__.py
             test_signals.py
 
-Output structure (container):
+Output structure (live, container):
     Same as above, MINUS login.py / auth.py. main.py uses zero-arg VortexAPI()
     because the Rupeezy platform injects VORTEX_ACCESS_TOKEN at runtime.
+
+Output structure (backtest):
+    No order_tracker.py / login.py / auth.py — backtests don't connect to the
+    live feed or place real orders. They read historical OHLCV and use one of
+    backtesting.py / vectorbt / backtrader.
 """
 
 import sys
@@ -63,10 +69,11 @@ def scaffold_directory(name, strategy_type):
 def write_main_py(base_dir, strategy_type, deployment):
     """Generate main.py with proper initialization.
 
-    The client-construction line differs between deployments:
-      - self-hosted: reads cached access_token from .access_token.json (populated by login.py)
-      - container:   zero-arg VortexAPI() — Rupeezy platform injects credentials at runtime
+    Live strategies wire: client → VortexFeed → OrderTracker → Strategy.
+    Backtest strategies skip the feed and tracker.
     """
+    is_live = strategy_type != 'backtest'
+
     if deployment == 'container':
         client_import = "from vortex_api import VortexAPI"
         client_setup = '''# On the Rupeezy container platform, credentials are injected at runtime
@@ -77,6 +84,39 @@ client = VortexAPI()'''
         client_setup = '''# Load the authenticated client — reads cached .access_token.json
 # (run `python login.py` once to populate it).
 client = get_client()'''
+
+    if is_live:
+        live_imports = '''from vortex_api import VortexFeed
+import time
+from order_tracker import OrderTracker'''
+        live_setup = '''# Postback-driven order tracker (see SKILL.md Critical Rule 9).
+# Refreshes from client.orders() + client.trades() on every postback, with a
+# 500 ms debounce so a many-fill order doesn\\'t trip the REST rate limit.
+tracker = OrderTracker(client)
+
+# Seed the cache from today\\'s existing orderbook. This marks orders that
+# were already terminal before we started as "already notified", so
+# on_terminal doesn\\'t fire for historical fills when we start refreshing.
+# Must be called BEFORE setting on_terminal and BEFORE placing orders.
+tracker.initialize()
+
+strategy = Strategy(config=config, risk_manager=risk_manager, client=client, tracker=tracker)
+
+# Wire the terminal callback. Strategy.on_order_terminal fires once per order
+# when it reaches COMPLETED / REJECTED / CANCELLED — even if no thread is
+# blocked in tracker.wait(). This is the primary order-outcome path for live
+# strategies; don\\'t call tracker.wait() inside Strategy.next().
+tracker.on_terminal = strategy.on_order_terminal
+
+# Connect the WebSocket. Postbacks now flow into the tracker, which refreshes
+# orderbook+tradebook and fires on_terminal as orders complete.
+wire = VortexFeed(access_token=client.access_token)
+wire.on_order_update = tracker.on_update   # legacy SDK property name; receives all 5 types
+wire.connect(threaded=True)
+time.sleep(1)  # let the connection stabilise'''
+    else:
+        live_imports = ''
+        live_setup = '''strategy = Strategy(config=config, risk_manager=risk_manager, client=client)'''
 
     content = '''#!/usr/bin/env python3
 """
@@ -92,6 +132,7 @@ import logging
 from datetime import datetime
 import pytz
 ''' + client_import + '''
+''' + live_imports + '''
 from config import Config
 from strategy import Strategy
 from risk_manager import RiskManager
@@ -110,7 +151,7 @@ IST = pytz.timezone('Asia/Kolkata')
 
 config = Config()
 risk_manager = RiskManager(config=config)
-strategy = Strategy(config=config, risk_manager=risk_manager, client=client)
+''' + live_setup + '''
 
 shutdown_event = False
 
@@ -157,19 +198,75 @@ if __name__ == '__main__':
     logger.info("Created main.py")
 
 
-def write_strategy_py(base_dir):
-    """Generate strategy.py with Strategy class."""
+def write_strategy_py(base_dir, strategy_type):
+    """Generate strategy.py with Strategy class. Live mode wires OrderTracker."""
+    is_live = strategy_type != 'backtest'
+
+    if is_live:
+        tracker_import = "from order_tracker import OrderTracker\n"
+        tracker_arg = ", tracker: OrderTracker"
+        tracker_assign = "        self.tracker = tracker\n"
+        # The terminal-status callback the strategy registers via
+        # tracker.on_terminal = self.on_order_terminal in main.py.
+        # Fires on the OrderTracker worker thread, NOT this thread.
+        terminal_method = '''
+    def on_order_terminal(self, order_id: str, status: str) -> None:
+        """Called once per order_id when it first reaches a terminal status.
+
+        Runs on the OrderTracker worker thread — if you mutate strategy state
+        shared with the main loop (positions, P&L, etc.), use a threading.Lock
+        or queue events for next() to drain.
+
+        Do NOT call wait() or any long REST request from here — it blocks the
+        refresh worker.
+        """
+        order = self.tracker.order(order_id)
+        if status == "COMPLETED":
+            avg = self.tracker.avg_fill_price(order_id)
+            qty = order.get("traded_quantity")
+            side = order.get("transaction_type")
+            symbol = order.get("symbol")
+            logger.info(
+                "FILL %s %s qty=%s avg=%.2f", side, symbol, qty, avg or 0.0
+            )
+            # TODO: update self.positions, self.pnl, etc.
+        elif status == "REJECTED":
+            logger.warning(
+                "REJECTED order_id=%s reason=%s",
+                order_id, order.get("status_message"),
+            )
+            # TODO: react — maybe retry, maybe alert, maybe halt the strategy
+        elif status == "CANCELLED":
+            logger.info("CANCELLED order_id=%s", order_id)
+'''
+    else:
+        tracker_import = ""
+        tracker_arg = ""
+        tracker_assign = ""
+        terminal_method = ""
+
     content = '''"""
 Trading strategy logic.
 
-The Strategy class encapsulates signal generation and order placement logic.
+The Strategy class is split into two entry points (live mode):
+
+  - next(tick):           called on every price tick. Place orders here,
+                          but NEVER block (no tracker.wait() calls).
+  - on_order_terminal():  called when one of your orders reaches a terminal
+                          status (COMPLETED / REJECTED / CANCELLED). Update
+                          self.positions / self.pnl from here.
+
+Both entry points operate on shared self.* state. on_order_terminal runs on
+the OrderTracker worker thread, so synchronise (lock or queue) if you mutate
+state read by next().
+
 All orders go through risk_manager.approve() before execution.
 """
 
 import logging
 from typing import Optional
 from vortex_api import VortexAPI
-from config import Config
+''' + tracker_import + '''from config import Config
 from risk_manager import RiskManager
 
 logger = logging.getLogger(__name__)
@@ -178,12 +275,12 @@ logger = logging.getLogger(__name__)
 class Strategy:
     """Base strategy implementation."""
 
-    def __init__(self, config: Config, risk_manager: RiskManager, client: VortexAPI):
+    def __init__(self, config: Config, risk_manager: RiskManager, client: VortexAPI''' + tracker_arg + '''):
         """Initialize strategy with configuration, risk controls, and broker client."""
         self.config = config
         self.risk_manager = risk_manager
         self.client = client
-        self.positions = {}
+''' + tracker_assign + '''        self.positions = {}
 
     def init(self):
         """Initialize strategy state (called once at startup).
@@ -198,21 +295,18 @@ class Strategy:
 
         Args:
             tick: Market data with symbol, ltp, bid, ask, volume, timestamp
+
+        Place orders here if signals fire — but DO NOT call self.tracker.wait()
+        from this method. Order outcomes arrive asynchronously via
+        self.on_order_terminal. Read self.tracker.status(order_id) /
+        self.tracker.order(order_id) on subsequent ticks if you need current
+        state of an in-flight order.
         """
         # TODO: Generate signals based on indicators
         # TODO: Check if we should enter/exit positions
         # TODO: Place orders through risk_manager
         pass
-
-    def on_order_fill(self, order):
-        """Callback when an order is filled."""
-        logger.info(f"Order filled: {order}")
-        # TODO: Update position tracking
-
-    def on_order_cancel(self, order):
-        """Callback when an order is cancelled."""
-        logger.info(f"Order cancelled: {order}")
-
+''' + terminal_method + '''
     def backtest(self):
         """Run strategy in backtest mode (paper trading)."""
         logger.info("Backtest mode not yet implemented")
@@ -650,6 +744,264 @@ if __name__ == "__main__":
     logger.info("Created login.py")
 
 
+def write_order_tracker_py(base_dir):
+    """Generate order_tracker.py — postback-driven OrderTracker class.
+
+    Same pattern documented in references/code-quality.md. Live strategies
+    instantiate this, wire `tracker.on_update` to `wire.on_order_update`, and
+    call `tracker.wait(order_id)` instead of polling.
+    """
+    content = '''"""
+Postback-driven order tracker. See SKILL.md Critical Rule 9 and
+references/code-quality.md for the full design rationale.
+
+The Vortex SDK\\'s `VortexFeed.on_order_update` callback fires for FIVE
+envelope types (order, trade, sl_trigger, gtt_order, position_conversion).
+Each one is treated as a SIGNAL that something changed for an order_id; we
+never trust `msg["data"]` as the new state. Instead, we refresh from
+`client.orders()` and `client.trades()` — the canonical source of truth.
+
+Coalescing: first postback starts a 500 ms debounce; further postbacks
+within the window accumulate for free. One REST refresh covers every dirty
+order_id. After the refresh, if more postbacks arrived during the REST
+calls, we refresh again immediately (no extra debounce). Prevents a
+many-fill order from melting the REST rate limit.
+
+Threading note: `on_terminal` fires on the refresh worker thread, NOT the
+strategy main thread. If your handler mutates shared state (positions, P&L,
+etc.), use a lock or queue events for the main loop to drain.
+"""
+
+import logging
+import threading
+import time
+from typing import Callable, Optional
+
+
+logger = logging.getLogger(__name__)
+
+
+class OrderTracker:
+    """Event-driven order tracker. See module docstring for design."""
+
+    TERMINAL = {"COMPLETED", "REJECTED", "CANCELLED"}
+    SUCCESS = {"COMPLETED"}
+    REFRESH_ON_TYPES = {
+        "order", "trade", "sl_trigger", "gtt_order", "position_conversion",
+    }
+
+    def __init__(self, client, debounce_seconds: float = 0.5):
+        self._client = client
+        self._debounce = debounce_seconds
+        self._lock = threading.Lock()
+        self._dirty = set()
+        self._worker_running = False
+        self._closed = False
+        self._orders = {}              # order_id -> orderbook row
+        self._trades = {}              # order_id -> list of tradebook rows
+        self._events = {}              # order_id -> threading.Event for wait()
+        self._notified_terminal = set()  # order_ids we have already fired on_terminal for
+
+        # Public callback: callable(order_id: str, status: str) -> None.
+        # Set this AFTER calling initialize() and BEFORE placing orders.
+        # Fires exactly once per order_id when it first appears as terminal.
+        self.on_terminal: Optional[Callable[[str, str], None]] = None
+
+    # ---- one-time startup seeding ----
+
+    def initialize(self):
+        """Seed the cache from today\\'s orderbook + tradebook WITHOUT firing
+        on_terminal for historical (already-terminal) orders.
+
+        Call this ONCE at startup, BEFORE setting on_terminal and BEFORE
+        placing any orders. Without it, on_terminal would fire on the first
+        refresh for every already-completed order from earlier in the day.
+        """
+        try:
+            book = self._client.orders() or {}
+            trades = self._client.trades() or {}
+        except Exception as exc:
+            logger.warning("OrderTracker.initialize() failed: %s", exc)
+            return
+        with self._lock:
+            for order in book.get("data") or []:
+                oid = order.get("order_id")
+                if not oid:
+                    continue
+                self._orders[oid] = order
+                if order.get("status") in self.TERMINAL:
+                    self._notified_terminal.add(oid)
+            per_order = {}
+            for tr in trades.get("trades") or []:
+                oid = tr.get("order_id")
+                if oid:
+                    per_order.setdefault(oid, []).append(tr)
+            for oid, lst in per_order.items():
+                self._trades[oid] = lst
+
+    # ---- postback entry point (runs on the WS reader thread) ----
+
+    def on_update(self, ws, msg):
+        """Wire to `wire.on_order_update`. Must NOT block."""
+        if msg.get("type") not in self.REFRESH_ON_TYPES:
+            return
+        order_id = (msg.get("data") or {}).get("order_id")
+        if not order_id:
+            return
+        with self._lock:
+            if self._closed:
+                return
+            self._dirty.add(order_id)
+            if not self._worker_running:
+                self._worker_running = True
+                try:
+                    threading.Thread(
+                        target=self._refresh_loop,
+                        daemon=True,
+                        name="OrderTracker-refresh",
+                    ).start()
+                except Exception:
+                    # Reset on thread-start failure so the next postback retries.
+                    self._worker_running = False
+                    raise
+
+    # ---- public read API ----
+
+    def wait(self, order_id, timeout):
+        """Block until terminal or `timeout` seconds. `timeout` is REQUIRED;
+        pass float("inf") to wait forever.
+
+        Script / test primitive only. In a live strategy main loop, prefer
+        `on_terminal` — `wait()` blocks the calling thread.
+
+        Returns True iff COMPLETED. False on REJECTED / CANCELLED / timeout.
+        After a timeout, the order may still be live at the broker; check
+        `status()` or `cancel_and_wait()` before placing a replacement.
+        """
+        with self._lock:
+            order = self._orders.get(order_id)
+            if order and order.get("status") in self.TERMINAL:
+                return order["status"] in self.SUCCESS
+            ev = self._events.setdefault(order_id, threading.Event())
+        ev.wait(timeout)
+        with self._lock:
+            return (self._orders.get(order_id) or {}).get("status") in self.SUCCESS
+
+    def cancel_and_wait(self, order_id, timeout):
+        """Cancel and block until the broker confirms terminal state.
+
+        Returns the actual terminal status — usually CANCELLED, but could
+        be COMPLETED if a fill races the cancel. ALWAYS check the return
+        value before placing a replacement.
+        """
+        cur = self.status(order_id)
+        if cur in self.TERMINAL:
+            return cur
+        try:
+            self._client.cancel_order(order_id=order_id)
+        except Exception as exc:
+            logger.info("cancel_order(%s) raised: %s", order_id, exc)
+        self.wait(order_id, timeout=timeout)
+        return self.status(order_id)
+
+    def status(self, order_id):
+        with self._lock:
+            return (self._orders.get(order_id) or {}).get("status")
+
+    def order(self, order_id):
+        with self._lock:
+            return dict(self._orders.get(order_id, {}))
+
+    def fills(self, order_id):
+        with self._lock:
+            return list(self._trades.get(order_id, []))
+
+    def avg_fill_price(self, order_id):
+        with self._lock:
+            order = self._orders.get(order_id)
+        if order:
+            qty = order.get("traded_quantity") or 0
+            px = order.get("traded_price") or 0
+            if qty > 0 and px > 0:
+                return float(px)
+        with self._lock:
+            trades = list(self._trades.get(order_id, []))
+        qty = sum((t.get("trade_quantity") or 0) for t in trades)
+        if qty == 0:
+            return None
+        notional = sum(
+            (t.get("trade_price") or 0) * (t.get("trade_quantity") or 0) for t in trades
+        )
+        return notional / qty
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+
+    # ---- worker ----
+
+    def _refresh_loop(self):
+        time.sleep(self._debounce)
+        while True:
+            with self._lock:
+                if not self._dirty or self._closed:
+                    self._worker_running = False
+                    return
+                self._dirty.clear()
+
+            try:
+                book = self._client.orders() or {}
+                trades = self._client.trades() or {}
+            except Exception as exc:
+                logger.warning("OrderTracker refresh failed: %s", exc)
+                with self._lock:
+                    if not self._dirty:
+                        self._worker_running = False
+                        return
+                continue
+
+            self._apply(book, trades)
+            # No extra sleep — if new postbacks arrived during the API calls,
+            # the next iteration sees them in _dirty and refreshes immediately.
+
+    def _apply(self, book, trades):
+        # Collect terminal transitions inside the lock; fire callbacks outside.
+        fire = []
+        with self._lock:
+            for order in book.get("data") or []:
+                oid = order.get("order_id")
+                if not oid:
+                    continue
+                self._orders[oid] = order
+                status = order.get("status")
+                if status in self.TERMINAL and oid not in self._notified_terminal:
+                    self._notified_terminal.add(oid)
+                    ev = self._events.get(oid)
+                    if ev is not None:
+                        ev.set()
+                    fire.append((oid, status))
+
+            per_order = {}
+            for tr in trades.get("trades") or []:
+                oid = tr.get("order_id")
+                if oid:
+                    per_order.setdefault(oid, []).append(tr)
+            for oid, lst in per_order.items():
+                self._trades[oid] = lst
+
+        # Outside the lock so user code in on_terminal can\\'t deadlock us.
+        handler = self.on_terminal
+        if handler is not None:
+            for oid, status in fire:
+                try:
+                    handler(oid, status)
+                except Exception:
+                    logger.exception("on_terminal handler raised for %s", oid)
+'''
+    (base_dir / 'order_tracker.py').write_text(content)
+    logger.info("Created order_tracker.py")
+
+
 def write_test_signals_py(base_dir):
     """Generate tests/test_signals.py with pytest fixture example."""
     content = '''"""
@@ -783,12 +1135,15 @@ def main():
 
     # Generate all files. login.py and auth.py are self-hosted only — the
     # container platform injects credentials and has no browser/disk for the
-    # OAuth loopback dance.
+    # OAuth loopback dance. order_tracker.py is live only — backtests don't
+    # connect to the live feed or place real orders.
     write_main_py(base_dir, args.type, args.deployment)
     if args.deployment == 'self-hosted':
         write_auth_py(base_dir)
         write_login_py(base_dir)
-    write_strategy_py(base_dir)
+    if args.type != 'backtest':
+        write_order_tracker_py(base_dir)
+    write_strategy_py(base_dir, args.type)
     write_risk_manager_py(base_dir)
     write_guardrails_py(base_dir)
     write_config_py(base_dir)

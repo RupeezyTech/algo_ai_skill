@@ -372,6 +372,8 @@ result = client.modify_order(
 
 ### Order History
 
+> **Don't put this in a sleep-loop.** `order_history()` returns the status-change timeline for one order. Call it on demand (manual debug, or once on startup to recover state) — never on a fixed interval. For tracking live orders, listen on `VortexFeed.on_order_update` and refresh from `client.orders()` (see SKILL.md Critical Rule 9). Polling on a timer is the anti-pattern; postback-driven refresh is fine.
+
 ```python
 history = client.order_history(order_id="ORDER_ID_STRING")
 # Returns list of status changes for a single order
@@ -380,6 +382,8 @@ for event in history.get("data", []):
 ```
 
 ### All Orders
+
+> **`orders()` is the canonical refresh target — call it on every postback (coalesced), never on a sleep-loop timer.** It returns the day's full order book in one call, which makes it ideal for the postback-driven refresh pattern from SKILL.md Critical Rule 9: a single `orders()` call after a 500 ms debounce window covers every dirty `order_id`, no matter how many postbacks fired. The anti-pattern is putting it in `while True: time.sleep(N): client.orders()` — that's polling, and it'll trip rate limits or miss transient states. Driven by `on_order_update` postbacks, it's correct and efficient.
 
 ```python
 orders = client.orders()
@@ -541,9 +545,23 @@ def on_price_update(ws, data):
         # Every tick carries a `ticker` field alongside the legacy exchange/token fields
         print(f"{tick['ticker']}: LTP={tick['last_trade_price']}")
 
-def on_order_update(ws, data):
-    """Called with order/trade notifications."""
-    print(f"Order status: {data.get('order_id')} = {data.get('status')}")
+def on_order_update(ws, msg):
+    """Called for ALL five postback envelope types — name is legacy SDK property.
+
+    Envelope: {"type": <kind>, "data": {...}, "client_code": "..."} where <kind> is
+    "order" | "trade" | "sl_trigger" | "gtt_order" | "position_conversion".
+
+    Treat the postback as a SIGNAL that something changed for an order_id, NOT
+    as the new state itself. Schedule a coalesced refresh from client.orders()
+    + client.trades() — those APIs are the source of truth. See SKILL.md Rule 9
+    or the Common Patterns example below.
+
+    This callback runs on the WebSocket reader thread — never do a blocking
+    REST call inside it. Mark the order_id dirty and hand off to a worker.
+    """
+    oid = (msg.get("data") or {}).get("order_id")
+    if oid:
+        schedule_refresh(oid)   # debounced; calls orders()+trades() once per ~500ms
 
 def on_close(ws, code, reason):
     """Called when connection closes."""
@@ -833,37 +851,38 @@ numpy>=1.24.0
 
 ### Full Order Lifecycle
 
+Use the `OrderTracker` class from `references/code-quality.md` (or the scaffolder-generated `order_tracker.py`). It coalesces postbacks, refreshes from `client.orders()` + `client.trades()`, and fires an `on_terminal(order_id, status)` callback for every terminal transition. Strategy code never parses `msg["data"]` and never polls the REST APIs on a timer.
+
 ```python
 from vortex_api import VortexAPI, VortexFeed
 from vortex_api import Constants as Vc
+from order_tracker import OrderTracker
 import time
 
-client = VortexAPI()
+client  = VortexAPI()
+tracker = OrderTracker(client)
+tracker.initialize()                # seed cache; historical fills don't fire on_terminal
 
-# Download master and look up token
-master = client.download_master()
-token = lookup_token(master, "RELIANCE", "NSE_EQ")
+def on_order_terminal(order_id, status):
+    """Fires on the OrderTracker worker thread when an order reaches terminal."""
+    order = tracker.order(order_id)
+    if status == "COMPLETED":
+        print(f"FILL {order_id} qty={order['traded_quantity']} avg={tracker.avg_fill_price(order_id):.2f}")
+    elif status == "REJECTED":
+        print(f"REJECTED {order_id}: {order.get('status_message')}")
+    elif status == "CANCELLED":
+        print(f"CANCELLED {order_id}")
 
-# Connect feed BEFORE placing order (don't miss update)
+tracker.on_terminal = on_order_terminal
+
 wire = VortexFeed(access_token=client.access_token)
-
-orders_placed = {}
-
-def on_order_update(ws, data):
-    order_id = data.get("order_id")
-    status = data.get("status")
-    print(f"Order {order_id}: {status}")
-    orders_placed[order_id] = status
-
-wire.on_order_update = on_order_update
+wire.on_order_update = tracker.on_update   # legacy SDK property name; receives all 5 types
 wire.connect(threaded=True)
+time.sleep(1)  # let the connection stabilise
 
-time.sleep(1)  # Let connection stabilize
-
-# Place order
+# Place orders without blocking — the callback handles outcomes.
 order = client.place_order(
-    exchange=Vc.ExchangeTypes.NSE_EQUITY,
-    token=token,
+    ticker="NSE:RELIANCE",
     transaction_type=Vc.TransactionSides.BUY,
     product=Vc.ProductTypes.DELIVERY,
     variety=Vc.VarietyTypes.REGULAR_LIMIT_ORDER,
@@ -872,21 +891,18 @@ order = client.place_order(
     trigger_price=0.0,
     validity=Vc.ValidityTypes.FULL_DAY,
 )
+order_id = order["data"]["order_id"]
 
-order_id = order.get("data", {}).get("order_id")
-print(f"Placed: {order_id}")
-
-# Wait for confirmation
-timeout = 30
-start = time.time()
-while time.time() - start < timeout:
-    if order_id in orders_placed and orders_placed[order_id] == "CONFIRMED":
-        print("Order confirmed!")
-        break
-    time.sleep(0.5)
+# strategy continues to run; on_order_terminal fires whenever the order completes.
+# If you need to kill this order before placing a replacement:
+final = tracker.cancel_and_wait(order_id, timeout=10)
+if final != "CANCELLED":
+    print(f"unexpected final state: {final} — do not place a replacement blindly")
 
 wire.close()
 ```
+
+`tracker.wait(order_id, timeout)` exists for tests and one-shot scripts. **Do not use it inside a live strategy main loop.** The `timeout` argument is required — pass `float("inf")` if you genuinely want to block forever.
 
 ### Position Monitoring
 

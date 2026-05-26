@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.10] - 2026-05-26
+
+### Added
+
+- **`OrderTracker` — postback-driven, event-callback-based order lifecycle tracking.** Lives canonically in `references/code-quality.md` and the scaffolder ships an equivalent `order_tracker.py` for live strategies. Public API:
+  - `tracker.initialize()` — one-time startup seed from `client.orders()` + `client.trades()` so historical (already-terminal) orders don't fire `on_terminal` on the first refresh.
+  - `tracker.on_update(ws, msg)` — wired to `wire.on_order_update`; non-blocking, schedules a debounced refresh.
+  - `tracker.on_terminal = callback` — fires once per `order_id` when it first reaches `COMPLETED` / `REJECTED` / `CANCELLED`. This is the **primary order-outcome path for live strategies**; runs on the refresh worker thread (callers using it must synchronise shared state).
+  - `tracker.wait(order_id, timeout)` — blocking wait. `timeout` is **required** (no default) — pass `float("inf")` to mean forever. Script / test primitive only; do not call from a live strategy main loop.
+  - `tracker.cancel_and_wait(order_id, timeout)` — cancel an order and block until the broker confirms terminal state. Returns the actual final status; callers MUST check it before placing a replacement (a fill can race the cancel).
+  - `tracker.status / order / fills / avg_fill_price` — read-side accessors for current state.
+- **Scaffolder generates the live-strategy state-machine layout by default.**
+  - New file `order_tracker.py` (live mode only — skipped in `--type backtest`).
+  - `main.py` (live) now wires: `client` → `OrderTracker(client)` → `initialize()` → `Strategy(...)` → `tracker.on_terminal = strategy.on_order_terminal` → `VortexFeed(...)` → `wire.on_order_update = tracker.on_update` → `wire.connect(threaded=True)` → `time.sleep(1)`. Order matters: `initialize` before `place_order`, `on_terminal` wired before `wire.connect`.
+  - `strategy.py` (live) gains an `on_order_terminal(self, order_id, status)` method with `COMPLETED` / `REJECTED` / `CANCELLED` branches. The old `on_order_fill` / `on_order_cancel` stubs are gone. `next(tick)` docstring now explicitly forbids `tracker.wait()` inside the strategy main loop.
+
+### Changed
+
+- **Critical Rule 9 fully rewritten — "postback is a signal, orderbook is the truth".** All five postback envelope types (`order`, `trade`, `sl_trigger`, `gtt_order`, `position_conversion`) are listed with what each one signals and where to refresh from. Strategy code no longer parses `msg["data"]` as the new state; it refreshes from `client.orders()` + `client.trades()` (the canonical source of truth). Postbacks are coalesced via a 500 ms debounce so a many-fill order doesn't trip the REST rate limit; after each refresh, if new postbacks arrived during the API calls, the worker refreshes again immediately (no extra debounce wait). Live strategies wire `tracker.on_terminal`; `wait()` is reframed as the script primitive with required `timeout`.
+- **`references/brokers/rupeezy-vortex.md` Common Patterns** rewritten around `OrderTracker.on_terminal` + `initialize()`. The previous inline `threading.Event` example is gone in favour of using the class; `cancel_and_wait` shown as the safe kill-before-replace primitive.
+- **`references/brokers/rupeezy-vortex.md` `client.orders()` / `client.order_history()` callouts** rewritten so they distinguish between "polling in a sleep-loop" (the anti-pattern) and "postback-driven refresh" (the recommended pattern). `orders()` is now explicitly endorsed as the canonical refresh target.
+- **Halved SKILL.md.** Always-loaded content dropped from 405 lines / 22 KB / ~5.5K tokens to ~216 lines / ~11 KB / ~2.8K tokens. No rules removed; only verbosity. Step-1 questions, code-architecture explainer, Critical Rule 8, Strategy Output Format file lists, Backtesting Standards, and Proactive Suggestions were all rewritten as terse bullets pointing to references for detail. Every numbered rule is preserved with the same mandate.
+
+### Fixed
+
+- **Skill was inadvertently teaching order-status polling.** A user-reported output from an earlier revision polled `client.orders()` in a `while time.sleep(N)` loop. Three concrete teaching errors fixed:
+  - Critical Rule 9 only said "Connect WebSocket BEFORE placing orders" — explained the consequence of late-connection but didn't forbid polling. An AI could satisfy the rule literally while polling.
+  - `references/brokers/rupeezy-vortex.md` documented `client.orders()` and `client.order_history()` with no warning that they were for one-shot inspection.
+  - `references/code-quality.md` shipped a `wait_for_order_fill()` function that polled `broker.get_order_status()` in a sleep-loop, with a docstring rationalising "polling instead of events to avoid callback hell". This was the actual teaching source for the failing AI output.
+- **Postback callback was reading the inner payload as if it were at the top level.** The SDK passes the full envelope `{"type": ..., "data": {...}, "client_code": ...}` to `on_order_update`; example code was doing `data["order_id"]` instead of `msg["data"]["order_id"]` — would `KeyError` on real traffic. All examples now filter on `msg["type"]` first and unwrap `msg["data"]`.
+- **Order-state machine race when thread-start fails.** `OrderTracker.on_update`'s spawn-worker path now uses `try/finally` to reset `_worker_running` if `Thread.start()` raises. Without this, a transient OS thread-resource failure would leave the flag stuck at `True` and silently disable all future refreshes.
+- Stale `lookup_token(master, "RELIANCE", "NSE_EQ")` snippet in the broker reference's "Common Patterns / Full Order Lifecycle" example that survived the 1.1.7 ticker rewrite — now uses `ticker="NSE:RELIANCE"`.
+- `references/code-quality.md` `OrderTracker._apply` now deduplicates `on_terminal` fires via `_notified_terminal` set, so an order that stays terminal across multiple refreshes only fires the callback once.
+
 ## [1.1.9] - 2026-05-26
 
 ### Changed
