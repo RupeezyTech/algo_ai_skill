@@ -51,30 +51,34 @@ assert df.index.is_monotonic_increasing
 
 ### Fetching Data from Vortex API
 
-Use `client.historical_candles()` to fetch from Vortex:
+Use `client.historical_candles()` to fetch from Vortex (vortex-api >= 2.1.8):
 
 ```python
-from vortex import Client
+import datetime
+import pandas as pd
+from vortex_api import VortexAPI, Constants as Vc
 
-client = Client()
+client = VortexAPI()
 
-# Download master to find token
-master = client.download_master()
-nifty_token = master[master['tradingsymbol'] == 'NIFTY50']['token'].iloc[0]
-
-# Fetch historical data
+# Fetch historical data — ticker form, no token lookup needed
 candles = client.historical_candles(
-    instrument_token=nifty_token,
-    interval='1D',
-    from_date='2023-01-01',
-    to_date='2025-12-31'
+    ticker="NSE:NIFTYIDX",
+    start=datetime.datetime(2023, 1, 1),
+    to=datetime.datetime(2025, 12, 31),
+    resolution=Vc.Resolutions.DAY,
 )
 
-# Convert to required format
-df = pd.DataFrame(candles)
-df['datetime'] = pd.to_datetime(df['timestamp'])
-df = df.set_index('datetime')
-df = df[['Open', 'High', 'Low', 'Close', 'Volume']].sort_index()
+# Returns parallel arrays keyed t/o/h/l/c/v — convert to the OHLCV DataFrame
+# that backtesting.py expects (capitalized column names, datetime index).
+df = pd.DataFrame({
+    "Open":   candles["o"],
+    "High":   candles["h"],
+    "Low":    candles["l"],
+    "Close":  candles["c"],
+    "Volume": candles["v"],
+}, index=pd.to_datetime(candles["t"], unit="s"))
+df.sort_index(inplace=True)
+df.index.name = "datetime"
 ```
 
 ### Data Availability Matrix

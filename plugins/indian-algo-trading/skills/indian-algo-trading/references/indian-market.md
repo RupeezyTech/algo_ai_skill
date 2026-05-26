@@ -289,16 +289,13 @@ target_price = round_to_tick(calculated_target, tick_size)
 
 ### Where to Get Tick Size
 
-Look up from instrument master alongside the token:
+Read it off the `Instrument` object — never assume, never hardcode:
 ```python
-master = client.download_master()
-headers = master[0]
-tick_idx = headers.index("tick")
-# ... find your instrument row ...
-tick_size = float(row[tick_idx])
+# Rupeezy/Vortex (vortex-api >= 2.1.8)
+tick_size = client.instruments.get_by_ticker("NSE:RELIANCE").tick
 ```
 
-Never assume a tick size. It varies by instrument, exchange, and price level.
+For other brokers, look up from their instrument master alongside the token. Tick size varies by instrument, exchange, and price level.
 
 ---
 
@@ -372,7 +369,7 @@ data providers.
 |-----------|----------------|
 | Live prices, quotes | Broker API (e.g., Vortex `client.quotes()`) |
 | Historical OHLCV | Broker API (e.g., Vortex `client.historical_candles()`) |
-| Instrument master | Broker API (e.g., Vortex `client.download_master()`) |
+| Instrument master | Broker SDK (e.g., Vortex `client.instruments.get_by_ticker(...)`; `client.download_master()` for whole-universe scans) |
 | FII/DII flows | Broker API (if available) or third-party data providers |
 | Open Interest by participant | Broker API (if available) or third-party data providers |
 | Bulk/block deals | Third-party data providers |
@@ -382,12 +379,12 @@ data providers.
 
 ## 13. Master Data & Runtime Requirements
 
-### Always Download Fresh Instrument Master
+### Always Resolve Instruments at Runtime
 
 - **Do not hardcode** lot sizes, tick sizes, tokens, or segment mappings
 - Lot sizes change (e.g., BANKNIFTY reduced from 20 to 15 lot in 2023)
 - Tick sizes vary by instrument and can change
-- Call `client.download_master()` at strategy start to fetch current instrument data
+- On Rupeezy/Vortex, use `client.instruments.get_by_ticker(...)` — the SDK caches `master.csv` on disk and downloads it at most once per IST trading day. For other brokers, call their equivalent of `client.download_master()` at strategy start.
 
 ### Fields to Load Per Instrument
 

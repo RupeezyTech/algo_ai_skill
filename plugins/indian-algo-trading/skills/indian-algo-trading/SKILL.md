@@ -14,7 +14,7 @@ description: >
   Vortex API, vortex-api, or asks about F&O strategy automation, options selling bot,
   intraday strategy, or positional strategy. Even if the user just says "write a strategy"
   or "help me automate my trading" — use this skill.
-version: 1.1.6
+version: 1.1.7
 ---
 
 # Indian Algo Trading — Strategy Writing Skill
@@ -34,7 +34,10 @@ Ask these questions (skip any the user has already answered):
 4. **Deployment mode?** Running on Rupeezy's container platform (auto-auth, no OAuth needed),
    or self-hosted on own machine? All Indian brokers mandatorily use OAuth 2.0 for
    self-hosted strategies — the code must handle the OAuth callback flow to obtain
-   an access token. Only container platforms (like Rupeezy's) inject credentials automatically.
+   an access_token. For self-hosted, **default to the loopback SSO pattern** (a tiny
+   local HTTP server that catches the redirect automatically) — never ask the user to
+   copy/paste an auth_token. See Critical Rule 8 and `scripts/scaffold_strategy.py`.
+   Container platforms (like Rupeezy's) inject credentials automatically.
 5. **Risk tolerance?** Max loss per trade, max daily loss, max drawdown they're comfortable with. If they don't know, suggest safe defaults: 1% per trade, 3% daily, 10% max drawdown.
 
 ### Step 2: Discuss Strategy Design
@@ -90,12 +93,16 @@ Every strategy MUST follow this structure. No exceptions.
 
 ```
 main.py          → Entry point, initialization, scheduling
+login.py         → Loopback SSO callback server (self-hosted only) — run once per session
+auth.py          → Credential helpers: get_client(), save_token() (self-hosted only)
 strategy.py      → Signal generation ONLY (no order placement here)
 execution.py     → Order placement, fill tracking (no signal logic here)
 risk_manager.py  → Position sizing, exposure checks, drawdown limits
 guardrails.py    → Psychological guardrails (daily loss limits, cooldowns)
 config.py        → All configurable parameters (no hardcoded values)
 ```
+
+`login.py` and `auth.py` exist only for **self-hosted** deployments. On the Rupeezy container platform, the runtime injects `VORTEX_ACCESS_TOKEN` directly and `VortexAPI()` is zero-argument — no login flow needed.
 
 Signal generation and execution are ALWAYS in separate modules. This allows:
 
@@ -152,21 +159,32 @@ These are non-negotiable. Every strategy must follow them.
 
 ### 1. NEVER hardcode instrument tokens
 
-Tokens change daily. Always look them up from the instrument master by symbol.
+Tokens change daily. Identify instruments by their **ticker** (`<EXCHANGE>:<SYMBOL>`) and let the SDK resolve everything else. On `vortex-api >= 2.1.8` (Rupeezy/Vortex), the ticker is accepted directly by every API: `place_order(ticker=...)`, `historical_candles(ticker=...)`, `get_order_margin(ticker=...)`, `client.quotes(instruments=["NSE:RELIANCE"], ...)`, `wire.subscribe(ticker=...)`, and every feed tick carries a `tick["ticker"]` field.
 
 ```python
 # WRONG — will break tomorrow
 token = 2885
+client.place_order(exchange="NSE_EQ", token=2885, ...)
 
-# RIGHT — dynamic lookup
-master = client.download_master()
-token = lookup_token(master, symbol="RELIANCE", exchange="NSE_EQ")
+# RIGHT — ticker form, never goes stale
+client.place_order(ticker="NSE:RELIANCE", ...)
+
+# Need the instrument's metadata (lot size, tick size, ISIN, expiry)?
+inst = client.instruments.get_by_ticker("NSE:RELIANCE")
+print(inst.lot_size, inst.tick, inst.isin)
 ```
+
+Ticker conventions for the Rupeezy master:
+
+- **Equities**: `"NSE:RELIANCE"`, `"BSE:TATAMOTORS"`
+- **Indices**: append `IDX` — `"NSE:NIFTYIDX"`, `"NSE:BANKNIFTYIDX"`, `"BSE:SENSEXIDX"`. The underlying `symbol` field stays bare (`"NIFTY"`), so F&O option-chain filtering uses `symbol == "NIFTY"`.
+- **F&O contracts**: each contract has its own ticker; use `client.instruments.all_by_underlying("NSE_FO", "NIFTY")` to iterate a chain.
+
+For brokers that don't have a ticker-first surface, use whatever symbolic identifier the broker exposes — never raw numeric tokens.
 
 ### 2. NEVER hardcode lot sizes
 
-Lot sizes change with corporate actions and SEBI directives. Look them up from the
-instrument master.
+Lot sizes change with corporate actions and SEBI directives. Read them off the instrument object: `client.instruments.get_by_ticker("NSE:NIFTYIDX").lot_size`. For other brokers, look them up from the instrument master.
 
 ### 3. ALWAYS use stop-losses
 
@@ -196,19 +214,51 @@ IST = pytz.timezone("Asia/Kolkata")
 
 All time comparisons use IST. Never rely on system timezone.
 
-### 8. Connect WebSocket BEFORE placing orders
+### 8. Use the loopback SSO login for self-hosted strategies
+
+**End users routinely confuse `auth_token` with `access_token`.** They are different:
+
+- `auth_token` — the short-lived `?auth=...` query parameter that lands on the OAuth callback URL.
+- `access_token` — the long-lived bearer token that `client.exchange_token(auth_token)` returns. This is the one you save and pass into `VortexAPI`.
+
+**Never ask the user to copy/paste either of these.** For self-hosted strategies, always ship a `login.py` script that:
+
+1. Spins up a stdlib `HTTPServer` on `127.0.0.1:8765/callback`.
+2. Opens `client.login_url(callback_param=...)` in the browser via `webbrowser.open(...)`.
+3. Captures the `?auth=...` query param from the redirect.
+4. Calls `client.exchange_token(auth_token)` automatically.
+5. Caches `client.access_token` to `.access_token.json`.
+
+The user runs `python login.py` once per session (~24h token lifetime); the main strategy reads the cached token via an `auth.get_client()` helper.
+
+```python
+# auth.py — strategy code uses this
+from vortex_api import VortexAPI
+client = get_client()  # raises a clear error if .access_token.json is missing
+
+# .env — only the persistent credentials live here
+VORTEX_API_KEY=...
+VORTEX_APPLICATION_ID=...
+# DO NOT put VORTEX_ACCESS_TOKEN in .env — it goes stale in 24h
+```
+
+The user's one-time setup: in the Rupeezy API Center, set the app redirect URL to `http://127.0.0.1:8765/callback`. The scaffolder (`scripts/scaffold_strategy.py`) ships this pattern by default — use it as the template when writing strategies from scratch.
+
+This rule does **not** apply to container deployments — Rupeezy's platform authenticates directly, and `VortexAPI()` is zero-argument.
+
+### 9. Connect WebSocket BEFORE placing orders
 
 If you connect after placing an order, that order's status update is lost. Always
 connect WebSocket feed as the first step after authentication.
 
-### 9. NEVER short sell illiquid equities intraday
+### 10. NEVER short sell illiquid equities intraday
 
 Short selling equities carries auction risk. If the stock hits upper circuit, you
 cannot exit and face penalties of 20%+ above your sell price. Check volume and circuit
 band before shorting. Prefer F&O for short positions. Read `references/indian-market.md`
 for full details on auction risk.
 
-### 10. ALWAYS respect tick sizes
+### 11. ALWAYS respect tick sizes
 
 Every instrument has a minimum tick size (from the instrument master's `tick` column).
 Order prices MUST be rounded to the nearest valid tick. Placing an order at ₹100.03
@@ -227,7 +277,7 @@ def round_to_tick(price, tick_size):
 Look up tick size from the instrument master alongside the token. Never assume a
 tick size — it varies by instrument and exchange.
 
-### 11. ALWAYS respect Daily Price Range (DPR)
+### 12. ALWAYS respect Daily Price Range (DPR)
 
 Exchanges set a daily price range (circuit limit band) for each instrument. Orders
 with prices outside this range are rejected by the broker's OMS before they even
@@ -239,13 +289,13 @@ reach the exchange. This commonly trips up limit orders and stop-loss orders.
   that the price falls within the allowed range
 - DPR information is available from the broker's quote/market data
 
-### 12. Account for calendar spread margin removal on expiry day
+### 13. Account for calendar spread margin removal on expiry day
 
 On expiry day, calendar spread margin benefits are removed. Margin can jump 5-10x
 (e.g., ₹26K → ₹2.6L per lot). Check if any spread leg expires today and ensure
 full margin is available. Read `references/risk-management.md` for details.
 
-### 13. NSE does NOT provide a public data API
+### 14. NSE does NOT provide a public data API
 
 NSE does not offer any direct data API for programmatic access. All market data
 (quotes, historical candles, order book) must come through your broker's API.

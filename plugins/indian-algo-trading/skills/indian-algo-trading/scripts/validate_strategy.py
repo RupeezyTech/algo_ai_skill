@@ -55,7 +55,7 @@ class StrategyValidator(ast.NodeVisitor):
                             'line': node.lineno,
                             'var': target.id,
                             'value': node.value.value,
-                            'msg': f'Line {node.lineno}: Hardcoded {target.id} = {node.value.value}. Use client.download_master() to look up tokens dynamically.'
+                            'msg': f'Line {node.lineno}: Hardcoded {target.id} = {node.value.value}. Pass ticker="<EXCHANGE>:<SYMBOL>" (e.g. "NSE:RELIANCE") to the API directly, or use client.instruments.get_by_ticker(...) to resolve metadata (vortex-api >= 2.1.8). For other brokers, use the broker SDK\'s instrument-master lookup.'
                         })
         self.generic_visit(node)
 

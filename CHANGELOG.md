@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.7] - 2026-05-26
+
+### Added
+
+- **Loopback SSO login pattern for self-hosted strategies.** New critical Rule 8 in `SKILL.md` requires shipping a `login.py` that spins up a stdlib `HTTPServer` on `127.0.0.1:8765/callback`, opens the SSO URL in the browser, and exchanges the captured `auth_token` for an `access_token` automatically. End users never see either token. Strategies read the cached token via `auth.get_client()`. Eliminates the most common end-user bug (confusing `auth_token` with `access_token`).
+- `scripts/scaffold_strategy.py` gained a `--deployment {self-hosted,container}` flag (default `self-hosted`). Self-hosted scaffolds ship `login.py` + `auth.py`; `main.py` calls `get_client()`; `.env.example` carries `VORTEX_API_KEY` + `VORTEX_APPLICATION_ID`; `requirements.txt` pulls in `python-dotenv`. Container scaffolds **skip** the login files entirely: `main.py` does zero-arg `VortexAPI()` (platform injects `VORTEX_ACCESS_TOKEN`), `.env.example` warns against putting broker credentials in `.env`, and `python-dotenv` is dropped from `requirements.txt`. "Next steps" output branches accordingly.
+- `references/brokers/rupeezy-vortex.md` Self-Hosted section rewritten with full `login.py` + `auth.py` code listings; manual OAuth flow demoted to an "advanced/headless only" footnote.
+
+### Changed
+
+- **Ticker-first guidance for vortex-api >= 2.1.8.** Critical Rule 1 in `SKILL.md` and the entire `references/brokers/rupeezy-vortex.md` reference now teach identifying instruments by ticker (`"NSE:RELIANCE"`) instead of `(exchange, token)` pairs. Updated examples:
+  - `place_order(ticker=...)`, `historical_candles(ticker=...)`, `get_order_margin(ticker=...)`
+  - `client.quotes(instruments=["NSE:RELIANCE"], ...)` — tickers accepted directly
+  - `wire.subscribe(ticker=..., mode=...)` and reading `tick["ticker"]` from VortexFeed updates
+  - `client.instruments.get_by_ticker(...)` / `get_by_exchange_token` / `get_by_isin` / `all_by_underlying` / `filter` replace hand-rolled CSV scanning
+- Replaced the broken `from vortex import Client` + `master[master['tradingsymbol']==…]` snippet in `references/backtesting.md` with a working ticker-form `historical_candles` call.
+- `references/indian-market.md` tick-size lookup, data-sources table, and "Always download fresh instrument master" sections now point to `client.instruments` for Vortex while remaining broker-agnostic.
+- `scripts/validate_strategy.py` — the "hardcoded token" violation message now recommends the ticker form first, with `client.instruments.get_by_ticker(...)` as the metadata-access path.
+- Documented the IDX ticker convention for indices (`"NSE:NIFTYIDX"`, `"NSE:BANKNIFTYIDX"`, `"BSE:SENSEXIDX"`) — the suffix lives on the ticker, the underlying symbol stays bare.
+- Bumped `requirements.txt` example from `vortex-api>=1.0.0` to `vortex-api>=2.1.8`.
+
+### Notes
+
+- Legacy `(exchange, token)` form is still accepted by the SDK but emits `FutureWarning`. One legacy example is retained per surface (orders, websocket) so users on older code can recognise the deprecated pattern.
+
 ## [1.1.4] - 2026-03-31
 
 ### Changed

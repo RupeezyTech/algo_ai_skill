@@ -14,8 +14,10 @@ pip install vortex-api
 
 Add to `requirements.txt`:
 ```
-vortex-api>=1.0.0
+vortex-api>=2.1.8
 ```
+
+> **2.1.8 is the version that introduced the ticker-first surface** (`client.instruments`, `place_order(ticker=...)`, `wire.subscribe(ticker=...)`, tick-level `ticker` field). Every example in this document uses that surface. If you must run on an older SDK, the legacy `exchange`+`token` form still works but emits `FutureWarning` and will be removed in a future release.
 
 ---
 
@@ -50,36 +52,126 @@ holdings = client.holdings()
 
 ### Self-Hosted (User's System)
 
-Strategy runs on your own machine/server. Manual OAuth authentication required.
+Strategy runs on your own machine/server. OAuth 2.0 authentication is mandatory — but **do not make the user copy/paste an auth code**. End users routinely confuse `auth_token` (the short-lived `?auth=...` query param) with `access_token` (the long-lived bearer token), and the resulting bug reports are painful. Ship a tiny local callback server that catches the redirect for them.
 
-**Setup:**
-1. Create application on Vortex portal → obtain Application ID and API Key
-2. Configure OAuth callback URL on portal
-3. Visit `https://flow.rupeezy.in?applicationId={APPLICATION_ID}`
-4. After login, capture `auth={auth_code}` from callback URL
-5. Exchange auth code for access token
+**One-time setup:**
+1. Create an application in the [Rupeezy API Center](https://vortex.rupeezy.in) → obtain `application_id` and `api_key`.
+2. **Set the app's redirect URL to `http://127.0.0.1:8765/callback`** (the loopback address the script below listens on).
+3. Save `VORTEX_API_KEY` and `VORTEX_APPLICATION_ID` to `.env`. Do **not** save `VORTEX_ACCESS_TOKEN` to `.env` — it expires every ~24h.
 
-**Initialization:**
+**`login.py` (run once per session, ~24h token lifetime):**
+
 ```python
+import threading
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
+
 from vortex_api import VortexAPI
 
-# Explicit credentials
-client = VortexAPI(api_key="your_api_key", application_id="your_application_id")
+from auth import API_KEY, APPLICATION_ID, save_token
 
-# Exchange auth code for access token
-client.exchange_token("received_auth_code")
-# client.access_token is now available
+HOST, PORT, PATH = "127.0.0.1", 8765, "/callback"
+
+
+class CallbackHandler(BaseHTTPRequestHandler):
+    auth_token = None
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path != PATH:
+            self.send_response(404); self.end_headers(); return
+        token = parse_qs(parsed.query).get("auth", [None])[0]
+        if token:
+            CallbackHandler.auth_token = token
+            self.send_response(200)
+            body = b"<h2>Login received. You can close this tab.</h2>"
+        else:
+            self.send_response(400)
+            body = b"<h2>Missing auth in callback.</h2>"
+        self.send_header("Content-Type", "text/html"); self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_):
+        pass
+
+
+def main():
+    client = VortexAPI(API_KEY, APPLICATION_ID)
+
+    url = client.login_url(callback_param="strategy-login")
+    print(f"Listening on http://{HOST}:{PORT}{PATH}")
+    print(f"Opening browser: {url}")
+    webbrowser.open(url)
+
+    server = HTTPServer((HOST, PORT), CallbackHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    while CallbackHandler.auth_token is None:
+        thread.join(0.2)
+    server.shutdown()
+
+    client.exchange_token(CallbackHandler.auth_token)
+    save_token(client.access_token)
+
+
+if __name__ == "__main__":
+    main()
 ```
 
-**Environment variables (recommended):**
+**`auth.py` (imported by both `login.py` and your strategy):**
+
+```python
+import json
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+from vortex_api import VortexAPI
+
+load_dotenv()
+
+API_KEY = os.environ["VORTEX_API_KEY"]
+APPLICATION_ID = os.environ["VORTEX_APPLICATION_ID"]
+TOKEN_FILE = Path(__file__).parent / ".access_token.json"
+
+
+def get_client() -> VortexAPI:
+    """Return a VortexAPI client with the cached access_token loaded."""
+    client = VortexAPI(API_KEY, APPLICATION_ID)
+    if not TOKEN_FILE.exists():
+        raise RuntimeError("Run `python login.py` first to authenticate.")
+    client.access_token = json.loads(TOKEN_FILE.read_text())["access_token"]
+    return client
+
+
+def save_token(access_token: str) -> None:
+    TOKEN_FILE.write_text(json.dumps({"access_token": access_token}))
+```
+
+**Strategy code (`main.py`):**
+
+```python
+from auth import get_client
+
+client = get_client()       # raises a clear error if token cache is missing
+print(client.funds())
+```
+
+This is the pattern `scripts/scaffold_strategy.py` ships by default — use it as the template.
+
+**Advanced (only when the loopback server can't run):** if you're on a headless box, you can still drive the OAuth flow manually by opening `client.login_url(...)`, capturing the `?auth=...` param yourself, and calling `client.exchange_token(auth_token)`. But for anything resembling an interactive user, prefer the loopback flow.
+
+**Environment variables — supported:**
 ```bash
 export VORTEX_API_KEY=your_api_key
 export VORTEX_APPLICATION_ID=your_application_id
-export VORTEX_ACCESS_TOKEN=your_access_token
+# VORTEX_ACCESS_TOKEN is also supported by zero-arg init, but expires every ~24h.
+# Prefer the file-cache pattern above so login.py can refresh it non-interactively.
 ```
 
 ```python
-# Zero-arg init picks up credentials from environment
+# Zero-arg init picks up credentials from environment (and access_token if set)
 client = VortexAPI()
 ```
 
@@ -99,102 +191,89 @@ client = VortexAPI(enable_logging=True)
 ```
 
 ### Self-Hosted OAuth Flow
-1. User visits `https://flow.rupeezy.in?applicationId={APPLICATION_ID}`
-2. After authentication, redirect contains `?auth={auth_code}`
-3. Exchange auth code for persistent access token:
 
-```python
-from vortex_api import VortexAPI
+Prefer the **loopback SSO pattern** documented under [Self-Hosted (User's System)](#self-hosted-users-system) — it eliminates the auth_token-vs-access_token confusion that trips up end users. Mechanics under the hood:
 
-client = VortexAPI(api_key="key", application_id="app_id")
-client.exchange_token(auth_code)  # Populates client.access_token
+1. Browser opens `client.login_url(callback_param=...)`.
+2. After SSO, Rupeezy redirects to the app's configured callback URL with `?auth={auth_token}`.
+3. The local loopback server captures `auth_token` and calls `client.exchange_token(auth_token)`, which sets `client.access_token` (the long-lived bearer token — this is what you persist).
 
-# Save access_token for future use — it persists across sessions
-saved_token = client.access_token
-```
+The `auth_token` is single-use and short-lived. The `access_token` is what every API call uses, and what you cache to `.access_token.json`. Never persist `auth_token`; never call API methods with it.
 
 ### Environment Variables
 Both deployment modes support environment-based configuration:
-- `VORTEX_API_KEY` — API secret (self-hosted only)
-- `VORTEX_APPLICATION_ID` — Application ID (self-hosted only)
-- `VORTEX_ACCESS_TOKEN` — Access token (optional, auto-generated on auth)
+- `VORTEX_API_KEY` — API secret (self-hosted only). Persistent, store in `.env`.
+- `VORTEX_APPLICATION_ID` — Application ID (self-hosted only). Persistent, store in `.env`.
+- `VORTEX_ACCESS_TOKEN` — Access token. **Container platform only.** On self-hosted, this expires every ~24h; let `login.py` refresh it into `.access_token.json` instead of pinning a stale value in `.env`.
 
 ---
 
 ## Instrument Master (Critical)
 
-Tokens change daily. Always look them up by symbol — never hardcode tokens.
+Tokens change daily. Identify instruments by their **ticker** (`<EXCHANGE>:<SYMBOL>`, e.g. `"NSE:RELIANCE"`) and let the SDK resolve everything else.
 
-### Download Master Data
+### Ticker Conventions
+
+- **Equities** — `"NSE:RELIANCE"`, `"NSE:INFY"`, `"BSE:TATAMOTORS"`
+- **Indices** — append `IDX`: `"NSE:NIFTYIDX"`, `"NSE:BANKNIFTYIDX"`, `"NSE:FINNIFTYIDX"`, `"BSE:SENSEXIDX"`. The `symbol` field of the index *row* is still bare (`"NIFTY"`); the `IDX` suffix only lives on the ticker.
+- **F&O contracts** — every contract has its own ticker (e.g. `"NSE:NIFTY24DECFUT"`), but the **underlying symbol** stays bare. So filtering the option chain uses `symbol == "NIFTY"`, not `"NIFTYIDX"`.
+
+### Lookups via `client.instruments`
+
+`client.instruments` is an `InstrumentManager`: thread-safe, lazily loaded, indexed by ticker / `(exchange, token)` / ISIN. It downloads `master.csv` on first lookup, caches on disk, and revalidates with conditional GETs at most once per IST trading day.
+
 ```python
 from vortex_api import VortexAPI
 
 client = VortexAPI()
-master = client.download_master()  # Returns list of lists
 
-# First row is header
-headers = master[0]
-# Columns: token, exchange, symbol, instrument_name, expiry_date,
-#          option_type, strike_price, tick, lot_size, ...
+# Forward lookup — the workhorse
+inst = client.instruments.get_by_ticker("NSE:RELIANCE")
+print(inst.token, inst.exchange, inst.lot_size, inst.tick, inst.isin)
 
-# Remaining rows are instrument data
-for row in master[1:]:
-    token = row[headers.index("token")]
-    symbol = row[headers.index("symbol")]
-    exchange = row[headers.index("exchange")]
-    lot_size = row[headers.index("lot_size")]
-    # ... process
+# Reverse lookup — useful when consuming positions / feed ticks
+inst = client.instruments.get_by_exchange_token("NSE_EQ", 2885)
+
+# ISIN → list of listings (an ISIN can list on multiple exchanges)
+listings = client.instruments.get_by_isin("INE002A01018")
+
+# Full option chain for an underlying
+chain = client.instruments.all_by_underlying("NSE_FO", "NIFTY")
+
+# Custom predicate filter
+ce = client.instruments.filter(
+    lambda i: i.exchange == "NSE_FO" and i.symbol == "NIFTY" and i.option_type == "CE"
+)
+
+# Force a fresh download (otherwise auto-refreshed once per IST trading day)
+client.instruments.refresh()
 ```
 
-### Token Lookup Pattern
+`Instrument` exposes every column from the master file as a typed attribute: `ticker`, `token`, `exchange`, `symbol`, `instrument_name`, `series`, `expiry_date`, `isin`, `option_type`, `strike_price`, `tick`, `lot_size`, `eligibility`, `name`, `last_trading_date`, `asm_gsm_stage`. Don't index into a CSV; just read the attribute.
+
+### Lot Size & Tick Size
+
+Both come straight off the `Instrument` object — never assume, never hardcode:
+
 ```python
-def lookup_token(master, symbol, exchange="NSE_EQ"):
-    """Find instrument token by symbol and exchange."""
-    headers = master[0]
-    symbol_idx = headers.index("symbol")
-    exchange_idx = headers.index("exchange")
-    token_idx = headers.index("token")
-
-    for row in master[1:]:
-        if row[symbol_idx] == symbol and row[exchange_idx] == exchange:
-            return int(row[token_idx])
-    return None
-
-# Usage
-token = lookup_token(master, "RELIANCE", "NSE_EQ")  # Returns 2885
+inst = client.instruments.get_by_ticker("NSE:RELIANCE")
+quantity = 2 * inst.lot_size          # Scale F&O orders by lot size
+price = round_to_tick(price, inst.tick)  # Round to nearest valid tick
 ```
 
-### Lot Size Lookup
-Lot sizes are dynamic and instrument-specific. Always look them up:
-```python
-def get_lot_size(master, token):
-    """Return lot size for an instrument token."""
-    headers = master[0]
-    token_idx = headers.index("token")
-    lot_size_idx = headers.index("lot_size")
+### When to use `client.download_master()`
 
-    for row in master[1:]:
-        if int(row[token_idx]) == token:
-            return int(row[lot_size_idx])
-    return 1  # Default if not found
+Only when you need to iterate the entire ~190k-row universe (e.g. computing aggregate analytics across all listed instruments). For any single lookup, `client.instruments.*` is dramatically faster and shares the same disk cache.
 
-# Usage
-lot = get_lot_size(master, 2885)  # Returns lot size for that token
-quantity = 2 * lot  # Always scale by lot size for F&O instruments
-```
+### Advanced — `PYVORTEX_*` env vars
 
-### Master Data Columns
-| Column | Type | Example | Notes |
-|--------|------|---------|-------|
-| token | int | 2885 | Unique identifier — look up by symbol |
-| exchange | str | NSE_EQ | NSE_EQ, BSE_EQ, NSE_FO, BSE_FO, MCX_FO |
-| symbol | str | RELIANCE | Stable across sessions |
-| instrument_name | str | EQUITIES | EQUITIES, EQIDX, FUTSTK, OPTIDX, etc. |
-| expiry_date | str | 2025-04-30 | Empty for equities; YYYY-MM-DD for F&O |
-| option_type | str | CE | CE, PE, or empty |
-| strike_price | float | 1000.00 | 0 for non-options |
-| tick | float | 0.05 | Minimum price movement |
-| lot_size | int | 1 | For equities: 1; for F&O: contract multiplier |
+The SDK defaults are sensible for almost every strategy. Strategy code should leave these alone; they're documented here only so you recognise them if you see them set in your environment.
+
+- `PYVORTEX_CACHE_DIR` — overrides the on-disk cache location (defaults to `~/.cache/pyvortex` with a `/tmp/pyvortex` fallback).
+- `PYVORTEX_REVALIDATE_SECONDS` — how long to trust the disk cache before issuing a conditional GET (default 900s).
+- `PYVORTEX_REQUEST_TIMEOUT` — HTTP timeout for the master download (default 30s).
+
+Do not set these from strategy code. If you need different behaviour, set them once at process startup (shell env, deployment manifest, etc.) — never inside `main.py`.
 
 ---
 
@@ -208,16 +287,15 @@ from vortex_api import VortexAPI, Constants as Vc
 client = VortexAPI()
 
 order = client.place_order(
-    exchange=Vc.ExchangeTypes.NSE_EQUITY,     # Exchange type
-    token=2885,                                 # Instrument token (from master)
-    transaction_type=Vc.TransactionSides.BUY, # BUY or SELL
-    product=Vc.ProductTypes.DELIVERY,          # DELIVERY, INTRADAY, MTF
+    ticker="NSE:RELIANCE",                        # Instrument ticker
+    transaction_type=Vc.TransactionSides.BUY,     # BUY or SELL
+    product=Vc.ProductTypes.DELIVERY,             # DELIVERY, INTRADAY, MTF
     variety=Vc.VarietyTypes.REGULAR_LIMIT_ORDER,  # Order variety
-    quantity=1,                                 # Number of units
-    price=2400.0,                              # Limit price (0 for market)
-    trigger_price=0.0,                         # Trigger price for SL orders
-    disclosed_quantity=0,                      # Iceberg order quantity
-    validity=Vc.ValidityTypes.FULL_DAY,       # DAY, IOC, AMO
+    quantity=1,                                   # Number of units
+    price=2400.0,                                 # Limit price (0 for market)
+    trigger_price=0.0,                            # Trigger price for SL orders
+    disclosed_quantity=0,                         # Iceberg order quantity
+    validity=Vc.ValidityTypes.FULL_DAY,           # DAY, IOC, AMO
 )
 
 print(f"Order ID: {order.get('data', {}).get('order_id')}")
@@ -226,8 +304,9 @@ print(f"Order ID: {order.get('data', {}).get('order_id')}")
 ### Parameters
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| exchange | str | Yes | Exchange type: NSE_EQ, BSE_EQ, NSE_FO, BSE_FO, MCX_FO |
-| token | int | Yes | Instrument token from master (never hardcode) |
+| ticker | str | Yes* | `<EXCHANGE>:<SYMBOL>` form, e.g. `"NSE:RELIANCE"`. Required unless legacy `exchange`+`token` are supplied. |
+| exchange | str | Legacy | Exchange type: NSE_EQ, BSE_EQ, NSE_FO, BSE_FO, MCX_FO. Required only with legacy `token`. Emits `FutureWarning`. |
+| token | int | Legacy | Instrument token from master. Required only with legacy `exchange`. Emits `FutureWarning`. |
 | transaction_type | str | Yes | BUY or SELL |
 | product | str | Yes | DELIVERY, INTRADAY, MTF |
 | variety | str | Yes | RL, RL-MKT, SL, SL-MKT |
@@ -243,8 +322,7 @@ print(f"Order ID: {order.get('data', {}).get('order_id')}")
 ```python
 # Buy 1 share of Reliance at ₹2400
 order = client.place_order(
-    exchange=Vc.ExchangeTypes.NSE_EQUITY,
-    token=2885,
+    ticker="NSE:RELIANCE",
     transaction_type=Vc.TransactionSides.BUY,
     variety=Vc.VarietyTypes.REGULAR_LIMIT_ORDER,
     quantity=1,
@@ -259,8 +337,7 @@ order = client.place_order(
 ```python
 # Buy immediately at market price
 order = client.place_order(
-    exchange=Vc.ExchangeTypes.NSE_EQUITY,
-    token=2885,
+    ticker="NSE:RELIANCE",
     transaction_type=Vc.TransactionSides.BUY,
     variety=Vc.VarietyTypes.REGULAR_MARKET_ORDER,
     quantity=1,
@@ -275,8 +352,7 @@ order = client.place_order(
 ```python
 # Sell 1 share if price falls to ₹2350, at limit ₹2340
 order = client.place_order(
-    exchange=Vc.ExchangeTypes.NSE_EQUITY,
-    token=2885,
+    ticker="NSE:RELIANCE",
     transaction_type=Vc.TransactionSides.SELL,
     variety=Vc.VarietyTypes.STOP_LIMIT_ORDER,
     quantity=1,
@@ -291,8 +367,7 @@ order = client.place_order(
 ```python
 # Sell immediately at market if price reaches trigger
 order = client.place_order(
-    exchange=Vc.ExchangeTypes.NSE_EQUITY,
-    token=2885,
+    ticker="NSE:RELIANCE",
     transaction_type=Vc.TransactionSides.SELL,
     variety=Vc.VarietyTypes.STOP_MARKET_ORDER,
     quantity=1,
@@ -322,8 +397,7 @@ except requests.exceptions.HTTPError as e:
 ```python
 # Calculate required margin before placing order
 margin = client.get_order_margin(
-    exchange=Vc.ExchangeTypes.NSE_EQUITY,
-    token=2885,
+    ticker="NSE:RELIANCE",
     transaction_type=Vc.TransactionSides.BUY,
     product=Vc.ProductTypes.DELIVERY,
     variety=Vc.VarietyTypes.REGULAR_LIMIT_ORDER,
@@ -448,9 +522,9 @@ for t in trades.get("trades", []):
 
 ### Live Quotes
 ```python
-# Instrument format: "{exchange}-{token}"
+# Pass tickers directly (vortex-api >= 2.1.8)
 quotes = client.quotes(
-    instruments=["NSE_EQ-2885", "NSE_EQ-26000"],  # Reliance, NIFTY
+    instruments=["NSE:RELIANCE", "NSE:NIFTYIDX"],
     mode=Vc.QuoteModes.LTP,
 )
 
@@ -468,16 +542,13 @@ for key, q in quotes.get("data", {}).items():
 import datetime
 
 client = VortexAPI()
-master = client.download_master()
-token = lookup_token(master, "RELIANCE", "NSE_EQ")
 
 # Daily candles for last 30 days
 end = datetime.datetime.now()
 start = end - datetime.timedelta(days=30)
 
 candles = client.historical_candles(
-    exchange=Vc.ExchangeTypes.NSE_EQUITY,
-    token=token,
+    ticker="NSE:RELIANCE",
     to=end,
     start=start,
     resolution=Vc.Resolutions.DAY,
@@ -521,15 +592,14 @@ wire = VortexFeed(access_token=client.access_token)
 ```python
 def on_connect(ws, response):
     """Called when WebSocket is ready. Subscribe here."""
-    ws.subscribe("NSE_EQ", 26000, Vc.QuoteModes.LTP)    # NIFTY
-    ws.subscribe("NSE_EQ", 2885, Vc.QuoteModes.FULL)    # RELIANCE
+    ws.subscribe(ticker="NSE:NIFTYIDX", mode=Vc.QuoteModes.LTP)
+    ws.subscribe(ticker="NSE:RELIANCE", mode=Vc.QuoteModes.FULL)
 
 def on_price_update(ws, data):
     """Called with price tick data."""
     for tick in data:
-        token = tick["token"]
-        ltp = tick["last_trade_price"]
-        print(f"Token {token}: {ltp}")
+        # Every tick carries a `ticker` field alongside the legacy exchange/token fields
+        print(f"{tick['ticker']}: LTP={tick['last_trade_price']}")
 
 def on_order_update(ws, data):
     """Called with order/trade notifications."""
@@ -561,12 +631,16 @@ wire.connect()
 
 ### Subscribe / Unsubscribe
 ```python
-# Subscribe to an instrument
-wire.subscribe("NSE_EQ", 2885, "ltp")
+# Ticker form (preferred)
+wire.subscribe(ticker="NSE:RELIANCE", mode="ltp")
+wire.unsubscribe(ticker="NSE:RELIANCE")
 
-# Unsubscribe
-wire.unsubscribe("NSE_EQ", 2885)
+# Legacy form — still accepted, emits FutureWarning
+wire.subscribe(exchange="NSE_EQ", token=2885, mode="ltp")
+wire.unsubscribe(exchange="NSE_EQ", token=2885)
 ```
+
+`VortexFeed` auto-constructs an `InstrumentManager` so every tick is tagged with a `ticker` field, regardless of how you subscribed. To share the cache with the REST client, pass `instruments=client.instruments` to the `VortexFeed` constructor.
 
 ### Important Notes
 - **Connect immediately after initializing the client** — if you place an order before connecting, you'll miss the order update notification
@@ -617,16 +691,13 @@ import pandas as pd
 from vortex_api import VortexAPI, Constants as Vc
 
 client = VortexAPI()
-master = client.download_master()
-token = lookup_token(master, "RELIANCE", "NSE_EQ")
 
-# Fetch daily candles
+# Fetch daily candles — ticker form (vortex-api >= 2.1.8)
 end = datetime.datetime.now()
 start = end - datetime.timedelta(days=365)
 
 candles = client.historical_candles(
-    exchange=Vc.ExchangeTypes.NSE_EQUITY,
-    token=token,
+    ticker="NSE:RELIANCE",
     to=end,
     start=start,
     resolution=Vc.Resolutions.DAY,
@@ -791,7 +862,7 @@ When deploying to Rupeezy's container platform, follow these constraints:
 ### Requirements File
 Keep `requirements.txt` minimal. Example:
 ```
-vortex-api>=1.0.0
+vortex-api>=2.1.8
 pandas>=2.0.0
 numpy>=1.24.0
 ```
@@ -808,11 +879,8 @@ import time
 
 client = VortexAPI()
 
-# Download master and look up token
-master = client.download_master()
-token = lookup_token(master, "RELIANCE", "NSE_EQ")
-
-# Connect feed BEFORE placing order (don't miss update)
+# Connect feed BEFORE placing order (don't miss update).
+# VortexFeed auto-constructs an InstrumentManager and tags every tick with a `ticker` field.
 wire = VortexFeed(access_token=client.access_token)
 
 orders_placed = {}
@@ -828,10 +896,9 @@ wire.connect(threaded=True)
 
 time.sleep(1)  # Let connection stabilize
 
-# Place order
+# Place order — ticker form
 order = client.place_order(
-    exchange=Vc.ExchangeTypes.NSE_EQUITY,
-    token=token,
+    ticker="NSE:RELIANCE",
     transaction_type=Vc.TransactionSides.BUY,
     product=Vc.ProductTypes.DELIVERY,
     variety=Vc.VarietyTypes.REGULAR_LIMIT_ORDER,
@@ -867,14 +934,13 @@ positions_data = {}
 
 def on_price_update(ws, data):
     for tick in data:
-        token = tick["token"]
-        ltp = tick["last_trade_price"]
-        positions_data[token] = ltp
+        # Key the cache by ticker — same string we used to subscribe
+        positions_data[tick["ticker"]] = tick["last_trade_price"]
 
 def on_connect(ws, response):
     # Subscribe to monitored instruments
-    ws.subscribe("NSE_EQ", 2885, "ltp")
-    ws.subscribe("NSE_EQ", 26000, "ltp")
+    ws.subscribe(ticker="NSE:RELIANCE", mode="ltp")
+    ws.subscribe(ticker="NSE:NIFTYIDX", mode="ltp")
 
 wire.on_connect = on_connect
 wire.on_price_update = on_price_update
@@ -884,14 +950,15 @@ wire.connect(threaded=True)
 for i in range(60):
     positions = client.positions()
     for pos in positions.get("data", {}).get("net", []):
-        token = pos.get("token")
+        # Resolve the ticker for this position via the instrument manager
+        inst = client.instruments.get_by_exchange_token(pos.get("exchange"), pos.get("token"))
         qty = pos.get("quantity")
         avg = pos.get("average_price")
 
-        if token in positions_data:
-            ltp = positions_data[token]
+        if inst.ticker in positions_data:
+            ltp = positions_data[inst.ticker]
             pnl = (ltp - avg) * qty
-            print(f"  {pos.get('symbol')}: qty={qty}, avg={avg}, ltp={ltp}, P&L={pnl}")
+            print(f"  {inst.ticker}: qty={qty}, avg={avg}, ltp={ltp}, P&L={pnl}")
 
     time.sleep(1)
 
@@ -951,8 +1018,9 @@ except Exception as e:
 This reference covers the complete Vortex SDK workflow: initialization, authentication, master data lookup, order placement, portfolio monitoring, market data, backtesting, and deployment. Follow the patterns here to build robust algorithmic trading strategies on Rupeezy's platform.
 
 **Key takeaways:**
-- Always look up tokens by symbol — never hardcode
-- Connect WebSocket immediately after client initialization
-- Use container platform for managed deployment; self-hosted for custom control
-- Backtest strategies before going live using save_backtest_result()
-- Handle errors gracefully; verify margin before placing orders
+- Identify instruments by their **ticker** (`"NSE:RELIANCE"`); pass `ticker=` to `place_order`, `historical_candles`, `get_order_margin`, `quotes`, and `wire.subscribe`. Never hardcode tokens — they change daily.
+- Read instrument metadata (lot size, tick size, ISIN) from `client.instruments.get_by_ticker(...)`.
+- Connect WebSocket immediately after client initialization.
+- Use container platform for managed deployment; self-hosted for custom control.
+- Backtest strategies before going live using `save_backtest_result()`.
+- Handle errors gracefully; verify margin before placing orders.
