@@ -28,7 +28,7 @@ Several `vortex-api` calls have signature changes that aren't always reflected i
 |---|---|
 | `client.place_order(...)` | `disclosed_quantity` is **REQUIRED** (pass `0` if no iceberg). Omitting it raises `TypeError`. |
 | `client.orders(limit, offset)` | **Both REQUIRED positional args.** No-args form raises `TypeError`. Try `limit=500, offset=0` first; the OrderTracker falls back to no-args on `TypeError` for older SDKs. |
-| `client.trades(limit, offset)` | Same as `orders()`: REQUIRED positional, with the same fallback approach. |
+| `client.trades()` | **Takes NO arguments** — `def trades(self)`. Calling `trades(limit, offset)` raises `TypeError`. (This is the *opposite* of `orders()`; the two are not symmetric.) |
 | `client.get_order_margin(...)` response | **Flat shape**, not nested: `{"status": "success", "required_margin": x, "available_margin": y}`. Older examples that read `response["data"]["margin"]` will `KeyError`. |
 
 ### Endpoint response envelope keys
@@ -43,7 +43,6 @@ The top-level key that holds the row list **varies by endpoint** — don't assum
 | `client.holdings()` | `"data"` (list) | `{"status": "success", "data": [holding, holding, ...]}` |
 | `client.positions()` | `"data"` (object) | `{"status": "success", "data": {"net": [...], "day": [...]}}` |
 | `client.funds()` | `"data"` (object, sometimes `{}`) | `{"data": {"equity": {...}, ...}}` — can be empty on some accounts |
-| `client.gtt_orders()` (GTT order book) | `"data"` (list) | `{"status": "success", "data": [trigger, trigger, ...]}` |
 | `client.place_order()` | `"data"` (single object) | `{"status": "success", "data": {"order_id": "..."}}` |
 | `client.get_order_margin(...)` | **flat** (no row list) | `{"status": "success", "initial_margin": x, "required_margin": y, "available_margin": z}` |
 | `client.historical_candles(...)` | **flat OHLCV arrays** | `{"s": "ok", "t": [...], "o": [...], "h": [...], "l": [...], "c": [...], "v": [...]}` — TradingView-style, single-letter keys, parallel arrays indexed by candle |
@@ -168,17 +167,40 @@ Both deployment modes support environment-based configuration:
 
 ## Instrument Master (Critical)
 
-Tokens change daily. Identify instruments by their **ticker** (`<EXCHANGE>:<SYMBOL>`, e.g. `"NSE:RELIANCE"`) and let the SDK resolve everything else.
+Tokens change daily. Identify instruments by their **ticker** — a stable per-instrument string the master assigns (e.g. `"NSE:RELIANCE"`) — and let the SDK resolve everything else. The ticker *looks like* `<EXCHANGE>:<SYMBOL>` for equities, but treat it as **opaque**: read it from `inst.ticker`, never assemble it from parts (see the warning under F&O contracts below — assembling it is the single most common ticker bug, and it fails specifically on F&O).
 
 ### Ticker Conventions
 
 - **Equities** — `"NSE:RELIANCE"`, `"NSE:INFY"`, `"BSE:TATAMOTORS"`
 - **Indices** — append `IDX`: `"NSE:NIFTYIDX"`, `"NSE:BANKNIFTYIDX"`, `"NSE:FINNIFTYIDX"`, `"BSE:SENSEXIDX"`. The `symbol` field of the index _row_ is still bare (`"NIFTY"`); the `IDX` suffix only lives on the ticker.
-- **F&O contracts** — every contract has its own ticker (e.g. `"NSE:NIFTY24DECFUT"`), but the **underlying symbol** stays bare. So filtering the option chain uses `symbol == "NIFTY"`, not `"NIFTYIDX"`.
+- **F&O contracts** — every contract has its own ticker (e.g. `"NSE:NIFTY24DECFUT"`, `"MCX:GOLDPETAL26JUNFUT"`), but the **underlying symbol** stays bare. So filtering the option chain uses `symbol == "NIFTY"`, not `"NIFTYIDX"`.
+
+> **NEVER construct a ticker. Always read `inst.ticker` off the `Instrument`.** A ticker is an opaque, per-contract identifier the master assigns — it is **not** `f"{exchange}:{symbol}"`. Building one yourself fails on F&O in two ways at once:
+>
+> 1. **Wrong exchange form.** The ticker prefix is the *short* exchange (`NSE`, `BSE`, `MCX`), but `inst.exchange` is the full segment code (`NSE_EQ`, `NSE_FO`, `MCX_FO`). `f"{inst.exchange}:{inst.symbol}"` yields `"MCX_FO:GOLDPETAL"` — the segment code is in the prefix slot, which the server does not recognise.
+> 2. **No contract identity.** `inst.symbol` is the bare underlying (`GOLDPETAL`, `NIFTY`) shared by *every* expiry. `exchange:symbol` can't name a single contract — and it can't even exist in the master, because `instruments` is keyed by `inst.ticker` and the five GOLDPETAL futures would collide on one key. The real ticker encodes the expiry (e.g. `"MCX:GOLDPETAL26JUNFUT"`).
+>
+> The trap is that `exchange:symbol` *coincidentally* works for equities (`NSE:RELIANCE`), so the pattern looks right until you hit a future or option. Concretely:
+>
+> ```python
+> # WRONG — fabricates a ticker that the server silently can't resolve
+> ticker = f"{inst.exchange}:{inst.symbol}"          # -> "MCX_FO:GOLDPETAL"
+>
+> # RIGHT — read what the master already assigned
+> contracts = client.instruments.filter(
+>     lambda i: i.symbol == "GOLDPETAL" and i.instrument_name == "FUTCOM"
+> )
+> selected = min(contracts, key=lambda i: i.expiry_date, default=None)  # nearest expiry
+> ticker = selected.ticker                            # -> "MCX:GOLDPETAL26JUNFUT"
+> ```
+>
+> **Failure signature:** a fabricated ticker does not raise. `historical_candles()` returns an empty OHLCV set, `quotes()` omits the symbol, and a `subscribe()` produces no ticks — so the symptom reads as *"no data / empty range window"*, pointing you at the time window instead of the ticker. If a contract you know is live returns no data, **log and check `selected.ticker` first.**
+>
+> **Always log `.ticker`.** When you print sampled/selected instruments, include the `ticker` field (`f"ticker={i.ticker} symbol={i.symbol} expiry={i.expiry_date}"`). If your debug line shows `symbol=`/`expiry=` but not `ticker=`, you never actually looked at the value you're trading on — which is exactly how a fabricated one slips through.
 
 ### Lookups via `client.instruments`
 
-`client.instruments` is an `InstrumentManager`: thread-safe, lazily loaded, indexed by ticker / `(exchange, token)` / ISIN. It downloads `master.csv` on first lookup, caches on disk, and revalidates with conditional GETs at most once per IST trading day.
+`client.instruments` is an `InstrumentManager`: thread-safe, lazily loaded, indexed by ticker / `(exchange, token)` / ISIN. It downloads `master.csv` on first lookup and caches it both in memory and on disk. Freshness is governed by a **15-minute revalidation cooldown** (`DEFAULT_REVALIDATE_AFTER_SECONDS = 900`, tunable via the `PYVORTEX_REVALIDATE_SECONDS` env var): within the cooldown it serves the cache with no network I/O; after it, it issues a *conditional* GET (`If-None-Match`/`If-Modified-Since`) that returns `304` when unchanged. So the network is re-checked every ~15 min, but a full re-download happens only when the master actually changes (roughly once per trading day).
 
 ```python
 from vortex_api import VortexAPI
@@ -187,7 +209,8 @@ client = VortexAPI()
 
 # Forward lookup — the workhorse
 inst = client.instruments.get_by_ticker("NSE:RELIANCE")
-print(inst.token, inst.exchange, inst.lot_size, inst.tick, inst.isin)
+# Note inst.ticker — always carry/log the master's ticker; never rebuild it from parts.
+print(inst.ticker, inst.token, inst.exchange, inst.lot_size, inst.tick, inst.isin)
 
 # Reverse lookup — useful when consuming positions / feed ticks
 inst = client.instruments.get_by_exchange_token("NSE_EQ", 2885)
@@ -203,15 +226,33 @@ ce = client.instruments.filter(
     lambda i: i.exchange == "NSE_FO" and i.symbol == "NIFTY" and i.option_type == "CE"
 )
 
-# Force a fresh download (otherwise auto-refreshed once per IST trading day)
+# Force a fresh download (otherwise revalidated after a 15-min cooldown via conditional GET)
 client.instruments.refresh()
 ```
 
 `Instrument` exposes every column from the master file as a typed attribute: `ticker`, `token`, `exchange`, `symbol`, `instrument_name`, `series`, `expiry_date`, `isin`, `option_type`, `strike_price`, `tick`, `lot_size`, `eligibility`, `name`, `last_trading_date`, `asm_gsm_stage`. Don't index into a CSV; just read the attribute.
 
+> **Lookups raise `InstrumentNotFound` on a miss — they don't return `None`.** `get_by_ticker`, `get_by_exchange_token`, and `get_by_isin` all raise `InstrumentNotFound` (importable from `vortex_api`) when the instrument isn't in the master. Wrap them in `try/except` for any ticker you don't fully control. The one exception is `get_ticker_or_none(exchange, token)`, a non-raising, non-blocking variant intended for the hot tick-parser path.
+
+#### Return types & memory — `all_by_underlying` / `filter`
+
+Both `all_by_underlying(exchange, underlying)` and `filter(predicate)` return a **fully materialised `List[Instrument]`**, not a lazy generator — the SDK builds the whole list before returning. There's no streaming/iterator variant for a single underlying, so the list size is bounded by the matching rows (an option chain is thousands of contracts, not the full ~190k universe). Two consequences:
+
+- **Don't stack extra list comprehensions on top of the returned list.** Once you have the chain, scan it with a generator + `min()` instead of building more intermediate lists. To pick the nearest expiry:
+  ```python
+  chain = client.instruments.all_by_underlying("NSE_FO", "NIFTY")  # already a list
+  # expiry_date is YYYYMMDD string → lexicographic sort == chronological; no parsing
+  nearest = min(
+      (i for i in chain if i.option_type in ("CE", "PE") and i.expiry_date >= today_yyyymmdd),
+      key=lambda i: i.expiry_date,
+      default=None,
+  )
+  ```
+- The `min(..., default=None)` guard returns `None` instead of raising `ValueError` when nothing matches — always handle the empty case.
+
 #### Field-format quirks observed in field testing
 
-- **`expiry_date` format differs across surfaces for the same contract.** Master CSV: `"20260529"` (zero-padded `YYYYMMDD`, no separator). REST orderbook row: `"2026-05-29"` (ISO). Postback envelope: `"29May2026"`. **Recommendation: don't parse the master form — `YYYYMMDD` is lexicographically sortable as a string**, so filter and sort with plain string compare. Avoids the whole parser-zoo bug class.
+- **`expiry_date` is always a `str`, never a `datetime.date`/`datetime`.** The `Instrument.expiry_date` attribute is typed `str` on the dataclass — comparing it to a `date` object silently does the wrong thing (or raises). The format also differs across surfaces for the same contract: Master CSV `"20260529"` (zero-padded `YYYYMMDD`, no separator); REST orderbook row `"2026-05-29"` (ISO); postback envelope `"29May2026"`. **Recommendation: don't parse the master form — `YYYYMMDD` is lexicographically sortable as a string**, so filter and sort (and pick the nearest expiry) with plain string compare. Avoids the whole parser-zoo bug class. If you genuinely need a `date` object, parse explicitly: `datetime.datetime.strptime(inst.expiry_date, "%Y%m%d").date()`.
 - **Futures rows use `option_type='XX'`** (or sometimes `'  '` — two spaces), **not** `None`/`""`. A naive `option_type in (None, "")` filter for futures misses them. Strike price is `0` or `-1` for futures. The robust check:
   ```python
   def is_future(inst):
@@ -592,8 +633,11 @@ from vortex_api import Constants as Vc
 
 client = VortexAPI()
 
-wire = VortexFeed(access_token=client.access_token)
+# Share the client's instrument index — see warning below
+wire = VortexFeed(access_token=client.access_token, instruments=client.instruments)
 ```
+
+> **Always pass `instruments=client.instruments`.** If you omit it, `VortexFeed` builds its *own* `InstrumentManager` and loads a second full copy of `master.csv` (~190k rows) into memory, independent of the one `VortexAPI` already holds. The two share the disk cache but **not** the in-memory index, so you pay for two copies. In memory-constrained deployments (containers under ~512 MB) the duplicate index is enough to trigger an OOMKill. Passing `client.instruments` reuses the already-loaded index — one copy, one network load.
 
 ### Callbacks
 
@@ -895,6 +939,12 @@ When deploying to Rupeezy's container platform, follow these constraints:
 - Rupeezy platform manages start/stop times via cron expressions
 - Each container invocation runs the strategy once from start to finish
 - Use tools `create_schedule`, `list_schedules`, `update_schedule` to set up automated runs
+
+### Source Encoding (ASCII only)
+
+- **Strategy source files must be pure ASCII.** Non-ASCII characters in docstrings, comments, or string literals — em dashes (`—`), arrows (`→`), `×`, `₹`, box-drawing characters (`─`, `│`, `└`) — break the upload: the server rejects the bundle with `SyntaxError: unexpected character after line continuation character` while processing it.
+- Use ASCII equivalents everywhere: `-` for `—`, `->` for `→`, `x` for `×`, `Rs` for `₹`, and plain `-`/`|`/`+` instead of box-drawing.
+- This bites most often when copying snippets out of this reference (which is full of em dashes and arrows) straight into a strategy file. Strip them first.
 
 ### Python Version
 
