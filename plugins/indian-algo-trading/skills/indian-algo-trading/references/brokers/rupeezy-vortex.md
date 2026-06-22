@@ -650,8 +650,11 @@ def on_connect(ws, response):
 def on_price_update(ws, data):
     """Called with price tick data."""
     for tick in data:
-        # Every tick carries a `ticker` field alongside the legacy exchange/token fields
-        print(f"{tick['ticker']}: LTP={tick['last_trade_price']}")
+        # Ticks are tagged with a `ticker` field alongside the legacy exchange/token
+        # fields — but enrichment is best-effort: if the instrument can't be resolved
+        # in the loaded master, there is NO `ticker` key. Use .get(), never tick['ticker'].
+        # `exchange` and `token` are always present.
+        print(f"{tick.get('ticker')}: LTP={tick['last_trade_price']}")
 
 def on_order_update(ws, msg):
     """Called for ALL five postback envelope types — name is legacy SDK property.
@@ -679,11 +682,27 @@ def on_error(ws, code, reason):
     """Called on connection error."""
     print(f"Error: {code} - {reason}")
 
+def on_open(ws):
+    """Called when the socket opens (one arg: the feed)."""
+    pass
+
+def on_reconnect(ws, attempts_count):
+    """Called on each reconnect attempt (two args)."""
+    print(f"Reconnecting... attempt {attempts_count}")
+
+def on_noreconnect(ws):
+    """Called when retries are exhausted. NOTE: receives the feed instance —
+    the SDK invokes it as on_noreconnect(ws), so a zero-arg def raises TypeError."""
+    print("Could not reconnect")
+
 wire.on_connect = on_connect
+wire.on_open = on_open
 wire.on_price_update = on_price_update
 wire.on_order_update = on_order_update
 wire.on_close = on_close
 wire.on_error = on_error
+wire.on_reconnect = on_reconnect
+wire.on_noreconnect = on_noreconnect
 ```
 
 ### Connection

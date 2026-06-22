@@ -108,7 +108,7 @@ These are non-negotiable. Every strategy must follow them.
 
 ### 1. NEVER hardcode instrument tokens
 
-Tokens change daily. Pass `ticker="<EXCHANGE>:<SYMBOL>"` to every Vortex API (`place_order`, `historical_candles`, `get_order_margin`, `client.quotes`, `wire.subscribe`) on `vortex-api >= 2.1.8`. Feed ticks carry `tick["ticker"]`.
+Tokens change daily. Pass `ticker="<EXCHANGE>:<SYMBOL>"` to every Vortex API (`place_order`, `historical_candles`, `get_order_margin`, `client.quotes`, `wire.subscribe`) on `vortex-api >= 2.1.8`. Never build a ticker from `exchange:symbol` (breaks on F&O) — read `inst.ticker` from the master. Feed ticks are tagged with `tick.get("ticker")` (best-effort enrichment; `exchange`/`token` always present).
 
 ```python
 client.place_order(ticker="NSE:RELIANCE", ...)              # RIGHT
