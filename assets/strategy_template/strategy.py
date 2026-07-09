@@ -164,8 +164,15 @@ class Strategy(ABC):
             return
 
         order = self.orders[order_id]
-        order.filled_quantity += filled_quantity
-        order.filled_price = filled_price
+        # Maintain a quantity-weighted average fill price across partial fills.
+        previous_quantity = order.filled_quantity
+        previous_price = order.filled_price or 0.0
+        new_filled_quantity = previous_quantity + filled_quantity
+        if new_filled_quantity > 0:
+            order.filled_price = (
+                previous_price * previous_quantity + filled_price * filled_quantity
+            ) / new_filled_quantity
+        order.filled_quantity = new_filled_quantity
         order.status = (
             "FILLED"
             if order.filled_quantity == order.quantity
