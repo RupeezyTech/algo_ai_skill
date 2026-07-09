@@ -118,6 +118,18 @@ time.sleep(1)  # let the connection stabilise'''
         live_imports = ''
         live_setup = '''strategy = Strategy(config=config, risk_manager=risk_manager, client=client)'''
 
+    # Resolve the run-mode branch at GENERATION time — the generated file must
+    # call strategy.backtest() or strategy.run() directly. (Interpolating
+    # strategy_type.upper() as a bare identifier produced `if "backtest" in
+    # BACKTEST:`, which NameErrors at runtime since BACKTEST/LIVE are never
+    # defined names in the generated file.)
+    if is_live:
+        run_call = '''logger.info("Running live mode")
+        strategy.run()'''
+    else:
+        run_call = '''logger.info("Running backtest mode")
+        strategy.backtest()'''
+
     content = '''#!/usr/bin/env python3
 """
 Main strategy entry point.
@@ -173,12 +185,7 @@ def main():
     signal.signal(signal.SIGTERM, handle_sigterm)
 
     try:
-        if ''' + ('"backtest"' if strategy_type == 'backtest' else '"live"') + ''' in ''' + strategy_type.upper() + ''':
-            logger.info("Running backtest mode")
-            strategy.backtest()
-        else:
-            logger.info("Running live mode")
-            strategy.run()
+        ''' + run_call + '''
 
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received")
@@ -367,7 +374,19 @@ class RiskManager:
             return False
 
         # Check 2: Position size limit
-        notional_value = order.get('quantity', 0) * order.get('price', 0)
+        # A market order with no price (or a missing/zero quantity) would
+        # make notional_value 0 and silently bypass this check - reject
+        # instead, since we cannot verify position size without both.
+        quantity = order.get('quantity', 0)
+        price = order.get('price', 0)
+        if not quantity or not price:
+            logger.warning(
+                f"Order missing quantity/price, cannot verify position size "
+                f"- rejecting: {order}"
+            )
+            return False
+
+        notional_value = quantity * price
         if notional_value > self.config.max_position_value:
             logger.warning(
                 f"Position too large: {notional_value:.2f} "
@@ -431,12 +450,22 @@ class CircuitBreaker:
         Returns:
             False if market is unhealthy (circuit broken)
         """
-        if tick.get('bid') == 0 or tick.get('ask') == 0:
-            logger.error("Zero bid/ask detected. Circuit breaker triggered.")
+        # Missing keys (.get returns None) or zero values are both unhealthy -
+        # check before doing any arithmetic so a missing 'ltp' can't KeyError
+        # and a missing 'bid' (None == 0 is False) can't slip past a bare
+        # `== 0` check.
+        bid = tick.get('bid')
+        ask = tick.get('ask')
+        ltp = tick.get('ltp')
+
+        if not bid or not ask or not ltp:
+            logger.error(
+                "Missing or zero bid/ask/ltp detected. Circuit breaker triggered."
+            )
             return False
 
-        spread = tick['ask'] - tick['bid']
-        spread_pct = (spread / tick['ltp']) * 100 if tick['ltp'] > 0 else 0
+        spread = ask - bid
+        spread_pct = (spread / ltp) * 100
 
         if spread_pct > self.max_spread_pct:
             logger.error(
@@ -1183,8 +1212,21 @@ class OrderTracker:
     logger.info("Created order_tracker.py")
 
 
-def write_test_signals_py(base_dir):
-    """Generate tests/test_signals.py with pytest fixture example."""
+def write_test_signals_py(base_dir, strategy_type):
+    """Generate tests/test_signals.py with pytest fixture example.
+
+    The strategy fixture must match Strategy.__init__'s generated signature
+    (see write_strategy_py): client is always required, and live scaffolds
+    add a required tracker arg. client=None / tracker=None are fine for unit
+    tests that don't exercise broker/order-tracking behaviour.
+    """
+    if strategy_type == 'backtest':
+        strategy_fixture_call = 'Strategy(config=config, risk_manager=risk_manager, client=None)'
+    else:
+        strategy_fixture_call = (
+            'Strategy(config=config, risk_manager=risk_manager, client=None, tracker=None)'
+        )
+
     content = '''"""
 Unit tests for strategy signals.
 
@@ -1216,7 +1258,7 @@ def risk_manager(config):
 @pytest.fixture
 def strategy(config, risk_manager):
     """Fixture: strategy instance."""
-    return Strategy(config=config, risk_manager=risk_manager)
+    return ''' + strategy_fixture_call + '''
 
 
 class TestSignalGeneration:
@@ -1330,7 +1372,7 @@ def main():
     write_config_py(base_dir)
     write_requirements_txt(base_dir, args.deployment)
     write_env_example(base_dir, args.deployment)
-    write_test_signals_py(base_dir)
+    write_test_signals_py(base_dir, args.type)
     write_tests_init(base_dir)
 
     logger.info("")
