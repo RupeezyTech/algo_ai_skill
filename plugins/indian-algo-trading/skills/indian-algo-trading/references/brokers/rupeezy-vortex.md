@@ -4,6 +4,29 @@ Complete reference for the Vortex Python SDK — the primary trading API for the
 
 ---
 
+## Broker Identification
+
+| | |
+|---|---|
+| Broker | Rupeezy |
+| Registered entity | Astha Credit & Securities Pvt Ltd |
+| SEBI registration | **INZ000187932** (stockbroker — NSE, BSE, MCX) |
+| Depository participant | SEBI DP Reg. IN-DP-611-2021 (NSDL IN303420, CDSL 94500) |
+| Exchange member codes | NSE 12227 · BSE 6844 · MCX 40000 |
+| CIN | U65929MP2003PTC016241 |
+| Registered office | 3rd Floor, Incubex INR4, 777c, 100 Feet Rd, HAL 2nd Stage, Indiranagar, Bengaluru, Karnataka 560038 |
+| API / SDK | Vortex — `vortex-api` on PyPI (Python) |
+| Developer portal | Rupeezy API Center — `https://vortex.rupeezy.in` (create an app here to obtain `application_id` and `api_key`) |
+| Authentication | OAuth 2.0 authorization-code flow; short-lived bearer `access_token` (~24h) |
+| API hosts | `vortex-api.rupeezy.in` (REST), `wire.rupeezy.in` (WebSocket), `static.rupeezy.in` (instrument master) |
+| Segments supported | `NSE_EQ`, `BSE_EQ`, `NSE_FO`, `BSE_FO`, `NSE_CD`, `MCX_FO` |
+| Deployment modes | Rupeezy-managed container, and self-hosted |
+| Instrument identity | Ticker-first (`"NSE:RELIANCE"`) on `vortex-api >= 2.1.8` |
+
+Registration details as published at `https://rupeezy.in`. **Not yet recorded here:** the public support contact, and rate limits for non-order endpoints (see "Rate limits" for what is published). Do not guess these — for a regulated broker a wrong number is worse than an absent one.
+
+---
+
 ## Installation
 
 Install the SDK via pip:
@@ -19,6 +42,8 @@ vortex-api>=2.1.8
 ```
 
 > **2.1.8 is the version that introduced the ticker-first surface** (`client.instruments`, `place_order(ticker=...)`, `wire.subscribe(ticker=...)`, tick-level `ticker` field). Every example in this document uses that surface. If you must run on an older SDK, the legacy `exchange`+`token` form still works but emits `FutureWarning` and will be removed in a future release.
+
+> **`>=` is deliberate — do not pin.** `2.1.8` is a **floor**, not a tested ceiling: strategies should pick up SDK fixes without a docs change. `scripts/validate_broker_adapter.py` emits a `VERSION_NOT_PINNED` warning for this; that warning is knowingly accepted here and should not be "fixed" by changing this line to `==`.
 
 ### SDK signature changes — observed in field testing
 
@@ -85,45 +110,134 @@ holdings = client.holdings()
 
 ### Self-Hosted (User's System)
 
-Strategy runs on your own machine/server. Manual OAuth authentication required.
+Strategy runs on your own machine/server. OAuth 2.0 authentication is mandatory — but **do not make the user copy/paste an auth code**. End users routinely confuse `auth_token` (the short-lived `?auth=...` query param) with `access_token` (the bearer token you actually save), and the resulting bug reports are painful. Ship a tiny local callback server that catches the redirect for them. This is SKILL.md Rule 8, and it is not optional.
 
-**Setup:**
+**One-time setup:**
 
-1. Create application on Vortex portal → obtain Application ID and API Key
-2. Configure OAuth callback URL on portal
-3. Visit `https://flow.rupeezy.in?applicationId={APPLICATION_ID}`
-4. After login, capture `auth={auth_code}` from callback URL
-5. Exchange auth code for access token
+1. Create an application in the Rupeezy API Center (`https://vortex.rupeezy.in`) → obtain `application_id` and `api_key`.
+2. **Set the app's redirect URL to exactly `http://127.0.0.1:8765/callback`** — the loopback address the script below listens on. No trailing slash, `http` not `https`. If this does not match, `login.py` opens the browser and then waits forever with no error.
+3. Save `VORTEX_API_KEY` and `VORTEX_APPLICATION_ID` to `.env`. Do **not** save `VORTEX_ACCESS_TOKEN` to `.env` — it is short-lived (~24h) and pinning it there makes the strategy fail silently a day later.
 
-**Initialization:**
+**`login.py` (run once per session, ~24h token lifetime):**
 
 ```python
+import threading
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
+
 from vortex_api import VortexAPI
 
-# Explicit credentials
-client = VortexAPI(api_key="your_api_key", application_id="your_application_id")
+from auth import API_KEY, APPLICATION_ID, save_token
 
-# Exchange auth code for access token
-client.exchange_token("received_auth_code")
-# client.access_token is now available
+HOST, PORT, PATH = "127.0.0.1", 8765, "/callback"
+
+
+class CallbackHandler(BaseHTTPRequestHandler):
+    auth_token = None
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path != PATH:
+            self.send_response(404); self.end_headers(); return
+        token = parse_qs(parsed.query).get("auth", [None])[0]
+        if token:
+            CallbackHandler.auth_token = token
+            self.send_response(200)
+            body = b"<h2>Login received. You can close this tab.</h2>"
+        else:
+            self.send_response(400)
+            body = b"<h2>Missing auth in callback.</h2>"
+        self.send_header("Content-Type", "text/html"); self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_):
+        pass
+
+
+def main():
+    client = VortexAPI(API_KEY, APPLICATION_ID)
+
+    url = client.login_url(callback_param="strategy-login")
+    print(f"Listening on http://{HOST}:{PORT}{PATH}")
+    print(f"Opening browser: {url}")
+    webbrowser.open(url)
+
+    server = HTTPServer((HOST, PORT), CallbackHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    while CallbackHandler.auth_token is None:
+        thread.join(0.2)
+    server.shutdown()
+
+    client.exchange_token(CallbackHandler.auth_token)
+    save_token(client.access_token)
+
+
+if __name__ == "__main__":
+    main()
 ```
 
-**Environment variables (recommended):**
+**`auth.py` (imported by both `login.py` and your strategy):**
+
+```python
+import json
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+from vortex_api import VortexAPI
+
+load_dotenv()
+
+API_KEY = os.environ["VORTEX_API_KEY"]
+APPLICATION_ID = os.environ["VORTEX_APPLICATION_ID"]
+TOKEN_FILE = Path(__file__).parent / ".access_token.json"
+
+
+def get_client() -> VortexAPI:
+    """Return a VortexAPI client with the cached access_token loaded."""
+    client = VortexAPI(API_KEY, APPLICATION_ID)
+    if not TOKEN_FILE.exists():
+        raise RuntimeError("Run `python login.py` first to authenticate.")
+    client.access_token = json.loads(TOKEN_FILE.read_text())["access_token"]
+    return client
+
+
+def save_token(access_token: str) -> None:
+    TOKEN_FILE.write_text(json.dumps({"access_token": access_token}))
+```
+
+**Strategy code (`main.py`):**
+
+```python
+from auth import get_client
+
+client = get_client()       # raises a clear error if the token cache is missing
+print(client.funds())
+```
+
+This is the pattern `scripts/scaffold_strategy.py --deployment self-hosted` ships by default — use it as the template rather than re-deriving it.
+
+**Headless boxes do not exempt you.** A machine with no browser is not a reason to fall back to pasting an auth code. Forward the loopback port to your own machine and run the flow there:
+
+```bash
+ssh -L 8765:127.0.0.1:8765 user@your-server
+# then, on the server: python login.py — the callback lands back on your laptop's browser
+```
+
+**Environment variables — self-hosted:**
 
 ```bash
 export VORTEX_API_KEY=your_api_key
 export VORTEX_APPLICATION_ID=your_application_id
-export VORTEX_ACCESS_TOKEN=your_access_token
-```
-
-```python
-# Zero-arg init picks up credentials from environment
-client = VortexAPI()
+# Do NOT set VORTEX_ACCESS_TOKEN here. It expires (~24h); let login.py refresh
+# it into .access_token.json instead of pinning a stale value.
 ```
 
 ---
 
-## Authentication
+## Authentication Pattern
 
 ### Container Platform
 
@@ -141,27 +255,27 @@ client = VortexAPI(enable_logging=True)
 
 ### Self-Hosted OAuth Flow
 
-1. User visits `https://flow.rupeezy.in?applicationId={APPLICATION_ID}`
-2. After authentication, redirect contains `?auth={auth_code}`
-3. Exchange auth code for persistent access token:
+Full listings for `login.py` and `auth.py` are in **Deployment Modes → Self-Hosted** above; this is the flow they implement, not a second way to do it.
 
-```python
-from vortex_api import VortexAPI
+1. `client.login_url(callback_param=...)` produces the SSO authorization URL. `login.py` opens it in the user's browser.
+2. The user authenticates; the provider redirects to the app's registered callback with `?auth={auth_token}`.
+3. The local loopback server on `127.0.0.1:8765/callback` captures that `auth_token` — the user never sees or handles it.
+4. `client.exchange_token(auth_token)` exchanges it for `client.access_token`.
+5. `save_token()` caches the `access_token` to `.access_token.json`; the strategy reads it via `auth.get_client()`.
 
-client = VortexAPI(api_key="key", application_id="app_id")
-client.exchange_token(auth_code)  # Populates client.access_token
-
-# Save access_token for future use — it persists across sessions
-saved_token = client.access_token
-```
+**Token validity:** the access token is short-lived — roughly **24 hours**. It is a session credential, not a durable secret: cache it to disk and re-run `python login.py` when it expires. Never commit it, and never pin it in `.env`. `auth_token` (the `?auth=` param) is single-use and shorter-lived still; it exists only to be exchanged.
 
 ### Environment Variables
 
-Both deployment modes support environment-based configuration:
+The two deployment modes are **disjoint** — do not mix them:
 
-- `VORTEX_API_KEY` — API secret (self-hosted only)
-- `VORTEX_APPLICATION_ID` — Application ID (self-hosted only)
-- `VORTEX_ACCESS_TOKEN` — Access token (optional, auto-generated on auth)
+| Variable | Self-hosted | Container |
+|---|---|---|
+| `VORTEX_API_KEY` | **Required**, in `.env` | Not used |
+| `VORTEX_APPLICATION_ID` | **Required**, in `.env` | Not used |
+| `VORTEX_ACCESS_TOKEN` | **Never set this.** Expires ~24h; `login.py` caches it to `.access_token.json` instead | **Injected by the platform** at runtime — this is what makes zero-arg `VortexAPI()` work |
+
+Zero-arg `VortexAPI()` is the container idiom. On self-hosted, construct the client through `auth.get_client()` so the cached token is loaded and a missing cache raises a clear error.
 
 ---
 
@@ -280,6 +394,21 @@ Both `all_by_underlying(exchange, underlying)` and `filter(predicate)` return a 
   ```
   If you must keep strings in config (e.g. driven by YAML/JSON), convert at the call site via `getattr(Vc.ProductTypes, name)` — but note the `getattr` argument is the **enum-member NAME**, not its `.value`. Many `Vc.*` enums have name ≠ value: `Vc.VarietyTypes.REGULAR_LIMIT_ORDER.value == "RL"`, `Vc.ValidityTypes.FULL_DAY.value == "DAY"`, `Vc.ExchangeTypes.NSE_EQUITY.value == "NSE_EQ"`. The scaffolded `config.py` stores enums directly to side-step both pitfalls.
 
+### Deriving CAS eligibility
+
+Since 3 Aug 2026 a cash-segment stock **with live F&O contracts** trades continuously only to 3:15 PM, then closes via a call auction (SKILL.md Rule 16; full rules in `references/indian-market.md` §1A). Vortex exposes **no documented CAS flag**, so derive eligibility from the F&O master:
+
+```python
+def is_cas_scrip(client, underlying: str) -> bool:
+    """True if this cash symbol has live F&O contracts -> CAS applies to it."""
+    return bool(client.instruments.all_by_underlying("NSE_FO", underlying))
+
+# is_cas_scrip(client, "RELIANCE") -> True
+# is_cas_scrip(client, "SOMESMALLCAP") -> False
+```
+
+Note `all_by_underlying` materialises the full contract list (see the memory note above), so resolve this **once at startup** per symbol and cache it — never per tick. The eligible set moves with SEBI's periodic F&O reviews, so re-resolve daily rather than hardcoding a list.
+
 ### Lot Size & Tick Size
 
 Both come straight off the `Instrument` object — never assume, never hardcode:
@@ -335,6 +464,26 @@ print(f"Order ID: {order.get('data', {}).get('order_id')}")
 | trigger_price      | float | Yes      | Trigger for stop-loss orders; 0 otherwise                                                                        |
 | disclosed_quantity | int   | **Yes**  | Partial disclosure for iceberg orders. Pass `0` if no iceberg — the SDK raises `TypeError` if this is omitted. |
 | validity           | str   | Yes      | DAY, IOC, or AMO                                                                                                 |
+
+### Variety selection near the close (CAS scrips)
+
+On a cash symbol with F&O contracts, the variety you may legally send changes through the afternoon. This is an **exchange** rule, not an SDK rule — the SDK will happily construct an order the exchange then rejects.
+
+| Time (IST) | Varieties accepted on a CAS scrip |
+|---|---|
+| to 3:15 | All varieties, as normal |
+| 3:15 - 3:20 | **None.** All order entry is rejected during the transition |
+| 3:20 - 3:25 | `REGULAR_LIMIT_ORDER` and `REGULAR_MARKET_ORDER` only |
+| 3:25 to random close (3:28-3:30) | `REGULAR_LIMIT_ORDER` only |
+
+`STOP_LIMIT_ORDER` / `STOP_MARKET_ORDER` are **not accepted in the auction at all**, and untriggered stop-loss orders already resting are cancelled by the exchange at 3:15 PM. Do not treat a resting SL as protection through the close: flatten before 3:15, or hold the stop in-process and convert it to a limit order inside the ±3% band. Auction limit prices must also clear that band, which is usually tighter than DPR (Rule 12).
+
+**Rupeezy-specific behaviour in this window — confirmed:**
+
+- **Rupeezy does not buffer orders.** An order sent during the 3:15-3:20 transition is **rejected**, not queued and forwarded at 3:20. Some brokers buffer; this one does not. Do not build a strategy that fires into the transition expecting the broker to hold the order — handle the rejection, or do not send.
+- **GTT orders do not trigger after 3:15 PM on CAS scrips.** A GTT is therefore **not** a way to keep protection alive through the closing auction. If your only stop on a CAS-scrip cash position is a GTT, that position is unprotected from 3:15 PM until the close.
+
+Between them these remove both workarounds a strategy might otherwise reach for. On a CAS scrip there is no broker-side mechanism that protects a cash position through the auction — the only safe pattern is to be flat before 3:15 PM, or to place a deliberate limit order into the auction inside the ±3% band and accept that it may not fill.
 
 ### Order Types
 
@@ -448,6 +597,28 @@ else:
 
 ---
 
+### Rate limits (order endpoints)
+
+Published at `https://vortex.rupeezy.in/docs/latest/regular-order/`:
+
+| Endpoint | Limit |
+|---|---|
+| Place order | 10/sec |
+| Modify order | 10/sec |
+| Cancel an order | 10/sec |
+| **Cancel multiple orders** | **1/sec** |
+| Fetch order book | 10/sec |
+| Fetch order history | 10/sec |
+| Modify order tags | 10/sec |
+
+> **`Cancel multiple orders` is 1/sec — ten times tighter than everything else.** This is the one a graceful-shutdown handler walks straight into: SIGTERM fires, the strategy tries to cancel every pending order at once, and the calls beyond the first in each second are rejected. Serialise bulk cancels at ≥1s intervals and confirm each cancellation via `OrderTracker` rather than assuming it landed. A shutdown path that reports success on rejected cancels leaves live orders in the market.
+
+Order-book and order-history reads share the 10/sec budget with order placement, which is a further reason to refresh on postback rather than poll (Rule 9): a sleep-loop poll spends rate limit that order placement needs.
+
+Limits for the other endpoints — trade book, positions, holdings, funds, quotes, historical candles, instrument master, margin — are not published on that page. Treat them as unknown and keep call rates conservative; the error code and retry semantics for exceeding a limit are likewise undocumented.
+
+---
+
 ## Order Management
 
 ### Cancel Order
@@ -499,7 +670,7 @@ for o in orders.get("data", []):
 
 ---
 
-## Portfolio Data
+## Positions, Holdings, and Funds
 
 ### Positions
 
@@ -581,7 +752,9 @@ for key, q in quotes.get("data", {}).items():
 - `OHLCV` — Open, High, Low, Close, Volume + LTP
 - `FULL` — OHLCV + bid/ask depth (5 levels) + open interest + DPR limits
 
-### Historical Candles
+### Historical Data (Candles)
+
+> **CAS scrips have no candles between 3:15 and 3:30 PM.** Not empty bars — none. There is no continuous matching in that window, so there are no prints to build them from. Consequences: the last element of an intraday series is the 3:14 bar, so code reading "the latest candle" at 3:22 acts on a stale price; a "wait for a new bar" loop never fires; and a CAS scrip yields fewer bars per day than a non-CAS one, so fixed bar-count lookbacks and multi-symbol alignment both shift. Drive closing-window logic off `datetime.now(IST)`, never off bar arrival, and join multi-symbol frames on timestamp rather than position. The daily close for these symbols also changed methodology on 3 Aug 2026 — see `references/indian-market.md` §1A.
 
 ```python
 import datetime
@@ -665,7 +838,7 @@ def on_order_update(ws, msg):
     Treat the postback as a SIGNAL that something changed for an order_id, NOT
     as the new state itself. Schedule a coalesced refresh from client.orders()
     + client.trades() — those APIs are the source of truth. See SKILL.md Rule 9
-    or the Common Patterns example below.
+    or the Common Patterns example in rupeezy-vortex-advanced.md.
 
     This callback runs on the WebSocket reader thread — never do a blocking
     REST call inside it. Mark the order_id dirty and hand off to a worker.
@@ -734,141 +907,59 @@ wire.unsubscribe("NSE_EQ", 2885)
 
 ---
 
-## Backtesting
-
-The platform supports multiple Python backtesting libraries. Results are saved and visualized on the web dashboard.
-
-### Supported Libraries
-
-- **backtesting.py** — Pass stats from `Backtest.run()`
-- **vectorbt** — Pass a `vbt.Portfolio` object
-- **backtrader** — Pass the strategy from `cerebro.run()[0]`
-
-### Save Backtest Result
-
-```python
-from backtesting import Backtest, Strategy
-
-# ... run backtest ...
-stats = bt.run()
-
-client.save_backtest_result(
-    stats=stats,
-    name="SMA Crossover on RELIANCE",
-    symbol="RELIANCE",
-    description="10/30 SMA crossover, daily bars",
-    tags=["sma", "crossover", "daily"],
-)
-```
-
-**Parameters:**
-
-- `stats` (required) — Result object from backtesting library
-- `name` (required) — Display name
-- `symbol` — Instrument symbol
-- `description` — Strategy notes
-- `tags` — Keywords for filtering
-
-**Returns:** `{"status": "success", "backtest_id": "uuid", "url": "..."}`
-
-### Data Preparation for backtesting.py
-
-```python
-import datetime
-import pandas as pd
-from vortex_api import VortexAPI, Constants as Vc
-
-client = VortexAPI()
-master = client.download_master()
-token = lookup_token(master, "RELIANCE", "NSE_EQ")
-
-# Fetch daily candles
-end = datetime.datetime.now()
-start = end - datetime.timedelta(days=365)
-
-candles = client.historical_candles(
-    exchange=Vc.ExchangeTypes.NSE_EQUITY,
-    token=token,
-    to=end,
-    start=start,
-    resolution=Vc.Resolutions.DAY,
-)
-
-# Create DataFrame with proper column names (capitalized)
-df = pd.DataFrame({
-    "Open": candles["o"],
-    "High": candles["h"],
-    "Low": candles["l"],
-    "Close": candles["c"],
-    "Volume": candles["v"],
-}, index=pd.to_datetime(candles["t"], unit="s"))
-
-df.sort_index(inplace=True)
-
-# Now use df with Backtest
-from backtesting import Backtest
-from backtesting.lib import crossover
-from backtesting.test import SMA
-
-class SmaCross(Strategy):
-    fast = 10
-    slow = 30
-
-    def init(self):
-        self.sma_fast = self.I(SMA, self.data.Close, self.fast)
-        self.sma_slow = self.I(SMA, self.data.Close, self.slow)
-
-    def next(self):
-        if crossover(self.sma_fast, self.sma_slow):
-            if not self.position:
-                self.buy()
-        elif crossover(self.sma_slow, self.sma_fast):
-            if self.position:
-                self.position.close()
-
-bt = Backtest(df, SmaCross, cash=100_000, commission=0.001)
-stats = bt.run()
-
-client.save_backtest_result(
-    stats=stats,
-    name="SMA 10/30",
-    symbol="RELIANCE",
-    tags=["sma"],
-)
-```
-
-### Parameter Optimization
-
-```python
-bt = Backtest(df, SmaCross, cash=100_000, commission=0.001)
-
-stats, heatmap = bt.optimize(
-    fast=range(5, 20, 2),
-    slow=range(20, 50, 5),
-    maximize="Sharpe Ratio",
-    return_heatmap=True,
-)
-
-client.save_optimization_result(
-    stats=stats,
-    heatmap=heatmap,
-    name="SMA Grid Search",
-    symbol="RELIANCE",
-    maximize="Sharpe Ratio",
-    param_ranges={
-        "fast": range(5, 20, 2),
-        "slow": range(20, 50, 5),
-    },
-)
-```
-
----
-
-## Constants Reference
+## Constants Mapping and Reference
 
 Access all constants via `from vortex_api import Constants as Vc`.
 
 > **Pass the enum, not the value.** The `Value` column below shows each constant's `.value` attribute (the underlying string), shown for reference and for parsing inbound payloads. **Do NOT pass the string to SDK calls** — the SDK strictly type-checks via `isinstance(value, EnumClass)` and rejects bare strings with `TypeError: <param> must be of type <EnumClass>`. See "Field-format quirks" → "Vc.* constants are runtime-typed enums" for the full rationale.
+
+### Generic-to-Vortex mapping
+
+If your strategy speaks a broker-neutral vocabulary, map it to Vortex **at the boundary**. The values below are `Vc.*` **enum instances, not strings** — a map of strings would raise `TypeError` on the first live call (Rule 15).
+
+```python
+from vortex_api import Constants as Vc
+
+EXCHANGE_MAP = {
+    "NSE_EQ": Vc.ExchangeTypes.NSE_EQUITY,
+    "BSE_EQ": Vc.ExchangeTypes.BSE_EQUITY,
+    "NSE_FO": Vc.ExchangeTypes.NSE_FO,
+    "BSE_FO": Vc.ExchangeTypes.BSE_FO,
+    "MCX_FO": Vc.ExchangeTypes.MCX,           # member is MCX, value is "MCX_FO"
+    "NSE_CD": Vc.ExchangeTypes.NSE_CURRENCY,
+}
+
+PRODUCT_MAP = {
+    "DELIVERY": Vc.ProductTypes.DELIVERY,     # CNC
+    "INTRADAY": Vc.ProductTypes.INTRADAY,     # MIS
+    "MTF":      Vc.ProductTypes.MTF,          # NSE_EQ only
+}
+
+TRANSACTION_MAP = {
+    "BUY":  Vc.TransactionSides.BUY,
+    "SELL": Vc.TransactionSides.SELL,
+}
+
+# Vortex calls these "varieties" — there is no separate order_type argument.
+ORDER_TYPE_MAP = {
+    "LIMIT":          Vc.VarietyTypes.REGULAR_LIMIT_ORDER,   # "RL"
+    "MARKET":         Vc.VarietyTypes.REGULAR_MARKET_ORDER,  # "RL-MKT"
+    "STOPLOSS_LIMIT": Vc.VarietyTypes.STOP_LIMIT_ORDER,      # "SL"     — trigger + limit
+    "STOPLOSS":       Vc.VarietyTypes.STOP_MARKET_ORDER,     # "SL-MKT" — trigger + market
+}
+
+# Statuses arrive as plain strings, not enums. Match by SUBSTRING — brokers emit
+# decorated forms such as REJECTED_BY_RMS, AMO_CANCELLED, EXECUTED_PARTIAL.
+STATUS_MAP = {
+    "FILLED":    ("COMPLETED", "EXECUTED"),   # same state, two names: postback vs orderbook
+    "REJECTED":  ("REJECTED",),
+    "CANCELLED": ("CANCELLED",),
+}
+```
+
+`"STOPLOSS"` maps to the **market** variety and `"STOPLOSS_LIMIT"` to the **limit** variety. If your own vocabulary differs, invert deliberately — getting this backwards turns a protective stop into an order that may never fill.
+
+Prefer identifying instruments by ticker (`"NSE:RELIANCE"`) over passing segment codes; use `EXCHANGE_MAP` only where a code genuinely must be supplied.
 
 ### Exchange Types
 
@@ -936,7 +1027,7 @@ Access all constants via `from vortex_api import Constants as Vc`.
 
 ---
 
-## Container Platform Rules
+## Deployment Considerations (Container Platform Rules)
 
 When deploying to Rupeezy's container platform, follow these constraints:
 
@@ -982,167 +1073,50 @@ numpy>=1.24.0
 
 ---
 
-## Common Patterns
+## Advanced Topics
 
-### Full Order Lifecycle
-
-Use the `OrderTracker` class from `references/code-quality.md` (or the scaffolder-generated `order_tracker.py`). It coalesces postbacks, refreshes from `client.orders()` + `client.trades()`, and fires an `on_terminal(order_id, status)` callback for every terminal transition. Strategy code never parses `msg["data"]` and never polls the REST APIs on a timer.
-
-```python
-from vortex_api import VortexAPI, VortexFeed
-from vortex_api import Constants as Vc
-from order_tracker import OrderTracker
-import time
-
-client  = VortexAPI()
-tracker = OrderTracker(client)
-tracker.initialize()                # seed cache; historical fills don't fire on_terminal
-
-def on_order_terminal(order_id, status):
-    """Fires on the OrderTracker worker thread when an order reaches terminal."""
-    order = tracker.order(order_id)
-    if status == "COMPLETED":
-        print(f"FILL {order_id} qty={order['traded_quantity']} avg={tracker.avg_fill_price(order_id):.2f}")
-    elif status == "REJECTED":
-        print(f"REJECTED {order_id}: {order.get('status_message')}")
-    elif status == "CANCELLED":
-        print(f"CANCELLED {order_id}")
-
-tracker.on_terminal = on_order_terminal
-
-wire = VortexFeed(access_token=client.access_token)
-wire.on_order_update = tracker.on_update   # legacy SDK property name; receives all 5 types
-wire.connect(threaded=True)
-time.sleep(1)  # let the connection stabilise
-
-# Place orders without blocking — the callback handles outcomes.
-order = client.place_order(
-    ticker="NSE:RELIANCE",
-    transaction_type=Vc.TransactionSides.BUY,
-    product=Vc.ProductTypes.DELIVERY,
-    variety=Vc.VarietyTypes.REGULAR_LIMIT_ORDER,
-    quantity=1,
-    price=2400.0,
-    trigger_price=0.0,
-    validity=Vc.ValidityTypes.FULL_DAY,
-)
-order_id = order["data"]["order_id"]
-
-# strategy continues to run; on_order_terminal fires whenever the order completes.
-# If you need to kill this order before placing a replacement:
-final = tracker.cancel_and_wait(order_id, timeout=10)
-if final != "CANCELLED":
-    print(f"unexpected final state: {final} — do not place a replacement blindly")
-
-wire.close()
-```
-
-`tracker.wait(order_id, timeout)` exists for tests and one-shot scripts. **Do not use it inside a live strategy main loop.** The `timeout` argument is required — pass `float("inf")` if you genuinely want to block forever.
-
-### Position Monitoring
-
-```python
-import time
-
-client = VortexAPI()
-wire = VortexFeed(access_token=client.access_token)
-
-positions_data = {}
-
-def on_price_update(ws, data):
-    for tick in data:
-        token = tick["token"]
-        ltp = tick["last_trade_price"]
-        positions_data[token] = ltp
-
-def on_connect(ws, response):
-    # Subscribe to monitored instruments
-    ws.subscribe("NSE_EQ", 2885, "ltp")
-    ws.subscribe("NSE_EQ", 26000, "ltp")
-
-wire.on_connect = on_connect
-wire.on_price_update = on_price_update
-wire.connect(threaded=True)
-
-# Monitor positions for 60 seconds
-for i in range(60):
-    positions = client.positions()
-    for pos in positions.get("data", {}).get("net", []):
-        token = pos.get("token")
-        qty = pos.get("quantity")
-        avg = pos.get("average_price")
-
-        if token in positions_data:
-            ltp = positions_data[token]
-            pnl = (ltp - avg) * qty
-            print(f"  {pos.get('symbol')}: qty={qty}, avg={avg}, ltp={ltp}, P&L={pnl}")
-
-    time.sleep(1)
-
-wire.close()
-```
-
-### Risk Management
-
-```python
-def can_trade(client, required_capital):
-    """Check if sufficient margin available before placing order."""
-    funds = client.funds()
-    available = funds.get("data", {}).get("equity", {}).get("margin_available", 0)
-    return available >= required_capital
-
-# Usage
-if can_trade(client, 50000):
-    order = client.place_order(...)
-else:
-    print("Insufficient margin")
-```
+Backtest data preparation, full order-lifecycle examples, position-monitoring and
+risk patterns, and broker-specific error handling have moved to
+`references/brokers/rupeezy-vortex-advanced.md` to keep this file cheap to load.
+Load it when you need that depth.
 
 ---
 
-## Error Handling
+## Known Limitations
 
-### Order Rejection
+Each item is documented in full in the section named; this list exists so the sharp edges are visible in one place.
 
-The rejection-reason field name **varies across the three surfaces** that can report a rejection for the same `order_id`:
+**SDK surface**
 
-| Surface | Field |
-|---|---|
-| Postback envelope (`wire.on_order_update` → `msg["data"]`) | `status_message` |
-| REST orderbook row (`client.orders()`) | `error_reason` |
-| `place_order()` synchronous response | `message` |
+- `client.orders(limit, offset)` requires both args; `client.trades()` takes none. The two are not symmetric — see "SDK signature changes".
+- `place_order(...)` requires `disclosed_quantity`; omitting it raises `TypeError`. Pass `0` when not using an iceberg.
+- `Vc.*` constants are runtime-typed enums. Passing the equivalent string raises `TypeError` on the first live call and is invisible to `py_compile` and unit tests.
+- The top-level response key differs per endpoint (`orders` / `trades` / `data` / flat) — see "Endpoint response envelope keys".
+- `client.funds()` can return an empty `data` object on some accounts. Never use it as a margin gate; use `get_order_margin()`.
+- The legacy `exchange` + `token` argument form still works but emits `FutureWarning` and is slated for removal.
 
-Always use the chained fallback (or `OrderTracker.rejection_reason(order_id)`, which does this for you):
+**Instruments and market coverage**
 
-```python
-def rejection_reason(row):
-    return row.get("status_message") or row.get("error_reason") or row.get("message")
+- Instrument tokens change daily. Only the ticker is stable, and F&O tickers must be read from `inst.ticker`, never assembled from parts.
+- `Vc.ProductTypes.MTF` is NSE_EQ only.
+- There is **no documented CAS eligibility flag** — derive it from the F&O master (see Instrument Master).
 
-order = client.place_order(...)
+**Historical data**
 
-if order.get("status") == "error":
-    print(f"Order rejected: {rejection_reason(order)}")
-elif order.get("status") == "success":
-    order_id = order["data"]["order_id"]
-    print(f"Order accepted: {order_id}")
-```
+- Intraday candles go back roughly 3 months; equities have years of daily history.
+- Futures: current contract only. Options: history until expiry only.
+- CAS scrips have **no bars at all** between 3:15 and 3:30 PM, and their daily close changed methodology on 3 Aug 2026 — see `references/indian-market.md` §1A.
 
-For rejections that arrive later (after `place_order` returned success but the RMS rejected during execution), the strategy's `on_order_terminal(order_id, status)` callback should also log `tracker.rejection_reason(order_id)`. The reference scaffolder generates this in `strategy.py`.
+**Container platform**
 
-### API Errors
+- Only `vortex-api.rupeezy.in`, `wire.rupeezy.in` and `static.rupeezy.in` are reachable; no third-party API calls.
+- No file logging; no in-code scheduling; source must be pure ASCII; Python 3.12/3.13/3.14 only.
 
-```python
-import requests
+**Not covered by this reference**
 
-try:
-    result = client.place_order(...)
-except requests.exceptions.HTTPError as e:
-    status = e.response.status_code
-    text = e.response.text
-    print(f"HTTP {status}: {text}")
-except Exception as e:
-    print(f"Unexpected error: {e}")
-```
+- GTT, bracket and cover order *placement*. `OrderTracker` refreshes on `gtt_order` and `position_conversion` postbacks, but the placement APIs are not documented here. Note **GTTs stop triggering at 3:15 PM on CAS scrips** — see "Variety selection near the close".
+- Rate limits for non-order endpoints (trade book, positions, holdings, funds, quotes, historical candles, instrument master, margin). Order-endpoint limits are documented under "Rate limits"; the rest are unpublished, as are timeouts, retry semantics, order latency, and whether a sandbox/paper endpoint exists.
+- CAS rejection codes. Order acceptance and GTT behaviour around the auction *are* documented under "Variety selection near the close"; the specific error strings returned are not.
 
 ---
 
@@ -1152,7 +1126,11 @@ This reference covers the complete Vortex SDK workflow: initialization, authenti
 
 **Key takeaways:**
 
-- Always look up tokens by symbol — never hardcode
+- Identify instruments by `inst.ticker` from `client.instruments` — never hardcode a token, never assemble a ticker from `exchange:symbol`
+- Pass `Vc.*` enum instances to every SDK call, never their string values
+- Self-hosted means `login.py` + `auth.py`; container means zero-arg `VortexAPI()`. Never `VORTEX_ACCESS_TOKEN` in a self-hosted `.env`
+- Cash intraday exits must clear the 3:15 PM closing auction on CAS scrips
+- Verify margin with `get_order_margin()`, not `funds()`
 - Connect WebSocket immediately after client initialization
 - Use container platform for managed deployment; self-hosted for custom control
 - Backtest strategies before going live using save_backtest_result()

@@ -224,11 +224,15 @@ def check_broker_info(content, result):
     """Check that broker identification is complete."""
     content_lower = content.lower()
 
-    # SEBI registration
-    if "sebi" in content_lower and re.search(r"IN[A-Z]\d+", content):
+    # SEBI registration.
+    # The number must appear NEAR the word "SEBI", not merely somewhere in the file:
+    # a bare IN[A-Z]\d+ search also matches the leading chunk of any ISIN in a code
+    # example (e.g. INE002A01018 -> "INE002"), which silently turned this check green
+    # on documents carrying no registration number at all.
+    if re.search(r"SEBI[^\n]{0,80}?\bIN[A-Z]\d{6,}", content, re.IGNORECASE):
         result.pass_("SEBI_REGISTRATION", "SEBI registration number found")
     else:
-        result.warn("NO_SEBI_NUMBER", "No SEBI registration number found (format: INxNNNNNN)")
+        result.warn("NO_SEBI_NUMBER", "No SEBI registration number found (expected near the word 'SEBI', format INxNNNNNN+)")
 
     # SDK name and version
     if re.search(r"pip install\s+[\w-]+", content):

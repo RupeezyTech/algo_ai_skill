@@ -181,14 +181,16 @@ is policy, not regulation:
 - **Intraday (MIS) auto-square-off time.** No exchange document sets one. Published cutoffs
   across major brokers range from roughly 3:00 to 3:12 PM for CAS scrips and differ per broker.
   Read your broker's policy; never hardcode a number.
-- **Order buffering 3:15-3:20 PM.** The exchange rejects everything in this window, but some
-  brokers queue orders locally and forward them at 3:20. An order "accepted" by a broker at
-  3:17 is not live at the exchange.
+- **Order buffering 3:15-3:20 PM.** The exchange rejects everything in this window. Some brokers
+  queue orders locally and forward them at 3:20; **Rupeezy does not — it rejects them.** Never
+  assume the broker is holding your order; verify per broker.
 - **GTT, AMO, cover and bracket orders** around CAS are broker products; no exchange circular
-  covers them.
-- **Rupeezy/Vortex CAS semantics are not documented in any circular.** Confirm order-acceptance
-  windows, square-off timing, GTT behaviour and CAS rejection codes against Rupeezy's own
-  developer notes before running anything live in the closing window.
+  covers them. **On Rupeezy, GTTs stop triggering at 3:15 PM on CAS scrips.**
+- **Net effect on a CAS scrip:** the exchange cancels resting stop-losses at 3:15 PM, and on
+  Rupeezy broker-side GTT triggers stop at the same moment. There is then **no mechanism that
+  protects a cash position through the auction.** Be flat before 3:15 PM, or place a deliberate
+  auction limit order inside the ±3% band and accept that it may not fill. Do not design around
+  a stop that "will fire during the auction" — nothing will fire.
 
 **Sources**: SEBI circular `SEBI/HO/47/11/11(3)2025-MRD-POD2/I/2765/2026` (16 Jan 2026);
 NSE `NSE/CMTR/73362` circular 38/2026 (18 Mar 2026); NSE CAS FAQ v1.0 (May 2026); BSE Notice

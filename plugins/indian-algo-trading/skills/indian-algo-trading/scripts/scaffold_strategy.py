@@ -66,6 +66,42 @@ def scaffold_directory(name, strategy_type):
     return base_dir
 
 
+# --- ASCII guard -------------------------------------------------------------
+# The Rupeezy container rejects non-ASCII strategy source: the server fails the
+# bundle with "SyntaxError: unexpected character after line continuation
+# character" while processing it (see references/brokers/rupeezy-vortex.md ->
+# "Source Encoding (ASCII only)"). Em dashes and arrows leak in easily from
+# copy-pasted prose, so every generated file goes through write_source(), which
+# transliterates the usual offenders and then HARD-FAILS if anything non-ASCII
+# survives. Do not bypass it with a bare write_text().
+
+_ASCII_SUBS = {
+    '\u2014': '--',   '\u2013': '-',    '\u2192': '->',  '\u2190': '<-',
+    '\u00d7': 'x',    '\u20b9': 'Rs ',  '\u2018': "'",   '\u2019': "'",
+    '\u201c': '"',    '\u201d': '"',    '\u2026': '...', '\u00b1': '+/-',
+    '\u2265': '>=',   '\u2264': '<=',   '\u2022': '*',   '\u00a0': ' ',
+    '\u2500': '-',    '\u2502': '|',    '\u2514': '+',   '\u251c': '+',
+    '\u2588': '#',    '\u2713': 'OK',   '\u26a0': '!',
+}
+
+
+def _to_ascii(text):
+    for bad, good in _ASCII_SUBS.items():
+        text = text.replace(bad, good)
+    return text
+
+
+def write_source(path, content):
+    """Write a generated file, guaranteeing pure ASCII.
+
+    Raises UnicodeEncodeError (loudly, at scaffold time) rather than shipping a
+    bundle the container will reject at upload time.
+    """
+    content = _to_ascii(content)
+    content.encode('ascii')          # explodes here if something slipped through
+    path.write_text(content, encoding='ascii')
+
+
 def write_main_py(base_dir, strategy_type, deployment):
     """Generate main.py with proper initialization.
 
@@ -191,7 +227,7 @@ def main():
 if __name__ == '__main__':
     sys.exit(main())
 '''
-    (base_dir / 'main.py').write_text(content)
+    write_source(base_dir / 'main.py', content)
     logger.info("Created main.py")
 
 
@@ -269,6 +305,7 @@ from typing import Optional
 from vortex_api import VortexAPI
 ''' + tracker_import + '''from config import Config
 from risk_manager import RiskManager
+import market_session as session
 
 logger = logging.getLogger(__name__)
 
@@ -282,6 +319,9 @@ class Strategy:
         self.risk_manager = risk_manager
         self.client = client
 ''' + tracker_assign + '''        self.positions = {}
+        # Resolved in init() -- which session clock this strategy runs on.
+        # Never hardcode a close time; see market_session.py.
+        self.segment = None
 
     def init(self):
         """Initialize strategy state (called once at startup).
@@ -289,7 +329,31 @@ class Strategy:
         Load historical data, set up subscriptions, warm up indicators.
         """
         logger.info("Initializing strategy")
+
+        # Resolve the session segment ONCE here, not per tick. A cash symbol with
+        # live F&O contracts stops continuous trading at 15:15 and closes via a call
+        # auction; one without runs to 15:30; derivatives run to 15:40.
+        # TODO: replace "RELIANCE" with your actual underlying, or set
+        #       is_derivative=True if this strategy trades F&O.
+        self.segment = session.segment_for(self.client, "RELIANCE", is_derivative=False)
+        logger.info("Session segment: %s (continuous ends %s IST)",
+                    self.segment, session.continuous_end(self.segment))
+
         # TODO: Load master data, set up WebSocket subscriptions
+
+    def must_square_off(self):
+        """True when the intraday exit deadline for this segment has arrived.
+
+        Call this from next() on every tick. Do NOT compare against a hardcoded
+        time -- the correct deadline differs per segment and changed with the
+        Closing Auction Session on 3 Aug 2026.
+        """
+        due, reason = session.should_exit_now(
+            self.segment, buffer_minutes=self.config.intraday_exit_buffer_minutes
+        )
+        if due:
+            logger.warning("Square-off due: %s", reason)
+        return due
 
     def next(self, tick):
         """Process each market tick.
@@ -324,7 +388,7 @@ class Strategy:
             "written yet. Implement it before starting this strategy."
         )
 '''
-    (base_dir / 'strategy.py').write_text(content)
+    write_source(base_dir / 'strategy.py', content)
     logger.info("Created strategy.py")
 
 
@@ -394,7 +458,7 @@ class RiskManager:
         self.daily_pnl += pnl
         logger.info(f"Daily P&L: {self.daily_pnl:.2f}")
 '''
-    (base_dir / 'risk_manager.py').write_text(content)
+    write_source(base_dir / 'risk_manager.py', content)
     logger.info("Created risk_manager.py")
 
 
@@ -464,7 +528,7 @@ class CircuitBreaker:
 
         return True
 '''
-    (base_dir / 'guardrails.py').write_text(content)
+    write_source(base_dir / 'guardrails.py', content)
     logger.info("Created guardrails.py")
 
 
@@ -561,7 +625,7 @@ class Config:
         assert self.max_open_positions > 0, "max_open_positions must be positive"
         return True
 '''
-    (base_dir / 'config.py').write_text(content)
+    write_source(base_dir / 'config.py', content)
     logger.info("Created config.py")
 
 
@@ -601,7 +665,7 @@ black>=21.0
 flake8>=3.9.0
 mypy>=0.910
 '''
-    (base_dir / 'requirements.txt').write_text(content)
+    write_source(base_dir / 'requirements.txt', content)
     logger.info("Created requirements.txt")
 
 
@@ -650,7 +714,7 @@ STRATEGY_TYPE=live
 LOG_LEVEL=INFO
 LOG_FILE=strategy.log
 '''
-    (base_dir / '.env.example').write_text(content)
+    write_source(base_dir / '.env.example', content)
     logger.info("Created .env.example")
 
 
@@ -709,7 +773,7 @@ def save_token(access_token: str) -> None:
     TOKEN_FILE.write_text(json.dumps({"access_token": access_token}))
     print(f"Token cached to {TOKEN_FILE}")
 '''
-    (base_dir / 'auth.py').write_text(content)
+    write_source(base_dir / 'auth.py', content)
     logger.info("Created auth.py")
 
 
@@ -806,7 +870,7 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 '''
-    (base_dir / 'login.py').write_text(content)
+    write_source(base_dir / 'login.py', content)
     logger.info("Created login.py")
 
 
@@ -1196,7 +1260,7 @@ class OrderTracker:
                 except Exception:
                     logger.exception("on_terminal handler raised for %s", oid)
 '''
-    (base_dir / 'order_tracker.py').write_text(content)
+    write_source(base_dir / 'order_tracker.py', content)
     logger.info("Created order_tracker.py")
 
 
@@ -1280,14 +1344,233 @@ class TestOrderExecution:
         # TODO: Add integration test with mock broker
         pass
 '''
-    (base_dir / 'tests' / 'test_signals.py').write_text(content)
+    write_source(base_dir / 'tests' / 'test_signals.py', content)
     logger.info("Created tests/test_signals.py")
+
+
+def write_market_session_py(base_dir):
+    """Generate market_session.py -- IST clock + session/CAS rules as code, not prose.
+
+    ASCII only: the Rupeezy container rejects non-ASCII source.
+    """
+    content = '''"""Indian market session rules -- the clock every strategy must obey.
+
+Import these instead of hardcoding times. The SEBI Closing Auction Session (CAS)
+took effect 3 Aug 2026 and gave the cash segment two different closes, so a single
+"market closes at 15:30" constant is now wrong for most liquid stocks.
+
+Segments:
+    CASH_CAS      cash equity in a scrip that HAS live F&O contracts.
+                  Continuous trading ends 15:15, then a call auction sets the close.
+    CASH_NON_CAS  cash equity with no F&O contracts. Continuous to 15:30 (unchanged).
+    DERIVATIVES   equity/index F&O. Continuous to 15:40 (extended by the CAS framework).
+
+Resolve which segment a symbol belongs to at RUNTIME via is_cas_scrip() -- the
+eligible set moves with SEBI's periodic F&O reviews. Never hardcode a symbol list.
+
+Reference: references/indian-market.md section 1A (sourced from the SEBI circular of
+16 Jan 2026, NSE/CMTR/73362, the NSE CAS FAQ, and BSE Notice 20260610-41).
+"""
+
+from datetime import date, datetime, time as dtime, timedelta
+
+import pytz
+
+IST = pytz.timezone("Asia/Kolkata")
+
+CASH_CAS = "CASH_CAS"
+CASH_NON_CAS = "CASH_NON_CAS"
+DERIVATIVES = "DERIVATIVES"
+
+# End of CONTINUOUS trading, per segment.
+CONTINUOUS_END = {
+    CASH_CAS: dtime(15, 15),
+    CASH_NON_CAS: dtime(15, 30),
+    DERIVATIVES: dtime(15, 40),
+}
+
+MARKET_OPEN = dtime(9, 15)
+
+# Closing Auction Session phase boundaries (CASH_CAS only).
+CAS_START = dtime(15, 15)          # transition begins; NO order entry accepted
+CAS_ORDER_ENTRY = dtime(15, 20)    # limit AND market orders accepted
+CAS_LIMIT_ONLY = dtime(15, 25)     # market-order requests rejected from here
+CAS_RANDOM_CLOSE_FIRST = dtime(15, 28)   # entry may end any moment from here...
+CAS_RANDOM_CLOSE_LAST = dtime(15, 30)    # ...and has certainly ended by here
+CAS_MATCHING_END = dtime(15, 35)   # closing price published by now
+
+POST_CLOSE_START = dtime(15, 50)   # moved from 15:40 by the CAS framework
+POST_CLOSE_END = dtime(16, 0)
+
+CAS_BAND = 0.03                    # +/-3% of the auction reference price, static
+
+# Pre-open realignment (SEBI): effective 7 Sep 2026 the pre-open mirrors CAS.
+PRE_OPEN_REALIGNMENT_DATE = date(2026, 9, 7)
+
+
+def now_ist():
+    """Timezone-aware current time in IST. Never use datetime.now()/utcnow()."""
+    return datetime.now(IST)
+
+
+def _as_time(value):
+    if value is None:
+        return now_ist().time()
+    if isinstance(value, datetime):
+        return value.time()
+    return value
+
+
+def continuous_end(segment):
+    """End of continuous trading for this segment."""
+    return CONTINUOUS_END[segment]
+
+
+def is_market_open(segment, now=None):
+    """True while continuous trading is running for this segment."""
+    t = _as_time(now)
+    return MARKET_OPEN <= t < CONTINUOUS_END[segment]
+
+
+def should_exit_now(segment, now=None, buffer_minutes=10):
+    """Should an intraday position be squared off? Returns (bool, reason).
+
+    buffer_minutes: how early to flatten before continuous trading ends. Your
+    broker's own MIS auto-square-off is SEPARATE and is broker policy -- check it;
+    published cutoffs sit around 15:00-15:12 for CAS scrips.
+    """
+    t = _as_time(now)
+    end = CONTINUOUS_END[segment]
+    exit_at = (datetime.combine(date.today(), end)
+               - timedelta(minutes=buffer_minutes)).time()
+
+    if t >= end:
+        if segment == CASH_CAS:
+            return True, ("Closing auction: continuous book shut at 15:15 and untriggered "
+                          "stop-loss orders were cancelled by the exchange. Limit orders "
+                          "inside the +/-3% band only; no market orders after 15:25.")
+        return True, "Past end of continuous trading (%s)" % end
+    return t >= exit_at, "Square-off buffer reached (continuous ends %s)" % end
+
+
+def can_send_order(segment, now=None):
+    """Will the exchange accept ANY order right now? Returns (bool, reason)."""
+    t = _as_time(now)
+    if segment != CASH_CAS:
+        return is_market_open(segment, t), "Outside continuous session" \\
+            if not is_market_open(segment, t) else "OK"
+
+    if t < CAS_START:
+        return True, "Continuous trading"
+    if t < CAS_ORDER_ENTRY:
+        return False, ("CAS transition 15:15-15:20: the exchange rejects all order entry. "
+                       "Rupeezy does NOT buffer -- the order is rejected, not queued.")
+    if t < CAS_RANDOM_CLOSE_LAST:
+        return True, "Closing auction order entry (may end randomly from 15:28)"
+    return False, "Closing auction order entry has ended"
+
+
+def can_send_market_order(segment, now=None):
+    """Market orders permitted right now? Returns (bool, reason).
+
+    Note: market orders RESTING from the 15:20-15:25 window are not flushed at 15:25
+    and still match (ahead of limit orders). Only new/modify/cancel requests are barred.
+    """
+    t = _as_time(now)
+    if segment != CASH_CAS:
+        return is_market_open(segment, t), "Segment follows normal continuous rules"
+    if t < CAS_START:
+        return True, "Continuous trading"
+    if t < CAS_ORDER_ENTRY:
+        return False, "CAS transition: no order entry at all"
+    if t < CAS_LIMIT_ONLY:
+        return True, "CAS accepts limit and market orders 15:20-15:25"
+    return False, "CAS is limit-only from 15:25; market-order requests are rejected"
+
+
+def stop_loss_is_protected(segment, now=None):
+    """Is a broker-side stop-loss still live? Returns (bool, reason).
+
+    On a CAS scrip the exchange cancels untriggered SL and disclosed-quantity orders
+    at 15:15, and on Rupeezy GTT triggers also stop firing at 15:15. After that NOTHING
+    broker-side protects a cash position through the auction.
+    """
+    t = _as_time(now)
+    if segment == CASH_CAS and t >= CAS_START:
+        return False, ("Exchange cancelled untriggered SL/disclosed-quantity orders at "
+                       "15:15; Rupeezy GTTs also stop triggering. Position is unprotected "
+                       "unless you send an auction limit order inside the +/-3% band.")
+    return True, "Broker-side stop-loss is live"
+
+
+def auction_band(reference_price):
+    """(low, high) limit-price bounds inside the CAS band.
+
+    reference_price is the VWAP of trades 15:00-15:15 for that symbol. It does not
+    exist before 15:15. If your data source does not publish it, accumulate
+    price*volume yourself from 15:00.
+    """
+    return (reference_price * (1 - CAS_BAND), reference_price * (1 + CAS_BAND))
+
+
+def clamp_to_auction_band(price, reference_price):
+    """Clamp a limit price into the CAS band. Round to tick AFTER calling this."""
+    low, high = auction_band(reference_price)
+    return min(max(price, low), high)
+
+
+def is_cas_scrip(client, underlying, _cache=None):
+    """True if this cash symbol has live F&O contracts, so CAS applies to it.
+
+    Vortex exposes no CAS flag, so derive it from the F&O master. all_by_underlying
+    materialises the full contract list, so resolve ONCE at startup per symbol --
+    never per tick. Re-resolve daily: the eligible set moves with SEBI F&O reviews.
+    """
+    if _cache is None:
+        _cache = is_cas_scrip.__dict__.setdefault("_memo", {})
+    if underlying not in _cache:
+        _cache[underlying] = bool(
+            client.instruments.all_by_underlying("NSE_FO", underlying)
+        )
+    return _cache[underlying]
+
+
+def segment_for(client, underlying, is_derivative=False):
+    """Resolve a symbol to one of the three segment constants."""
+    if is_derivative:
+        return DERIVATIVES
+    return CASH_CAS if is_cas_scrip(client, underlying) else CASH_NON_CAS
+
+
+def pre_open_schedule(on_date=None):
+    """Pre-open phase boundaries. Structure changed on 7 Sep 2026 to mirror CAS.
+
+    Returns a dict of phase -> (start, end). The realigned session closes order entry
+    RANDOMLY between 09:08 and 09:10, so there is no safe 09:07:59 submit-and-pull.
+    """
+    on_date = on_date or now_ist().date()
+    if on_date >= PRE_OPEN_REALIGNMENT_DATE:
+        return {
+            "limit_and_market": (dtime(9, 0), dtime(9, 5)),
+            "limit_only": (dtime(9, 5), dtime(9, 10)),
+            "random_close": (dtime(9, 8), dtime(9, 10)),
+            "matching": (dtime(9, 10), dtime(9, 12)),
+            "transition_to_cts": (dtime(9, 12), dtime(9, 15)),
+        }
+    return {
+        "order_entry": (dtime(9, 0), dtime(9, 8)),
+        "matching": (dtime(9, 8), dtime(9, 12)),
+        "buffer": (dtime(9, 12), dtime(9, 15)),
+    }
+'''
+    write_source(base_dir / 'market_session.py', content)
+    logger.info("Created market_session.py")
 
 
 def write_tests_init(base_dir):
     """Generate tests/__init__.py."""
     content = '"""Test suite for trading strategy."""\n'
-    (base_dir / 'tests' / '__init__.py').write_text(content)
+    write_source(base_dir / 'tests' / '__init__.py', content)
 
 
 def main():
@@ -1345,6 +1628,7 @@ def main():
     write_risk_manager_py(base_dir)
     write_guardrails_py(base_dir)
     write_config_py(base_dir)
+    write_market_session_py(base_dir)
     write_requirements_txt(base_dir, args.deployment)
     write_env_example(base_dir, args.deployment)
     write_test_signals_py(base_dir)
