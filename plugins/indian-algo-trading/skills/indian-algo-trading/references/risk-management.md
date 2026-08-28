@@ -145,6 +145,14 @@ position_size = int(100000 * kelly_fraction)  # ₹5,400 per trade
 
 ## 2. Stop-Loss Patterns
 
+> **CAS caveat, from 3 Aug 2026.** In the cash segment, for any symbol with live derivative
+> contracts, the exchange **cancels untriggered stop-loss and disclosed-quantity orders at
+> 3:15 PM** when the closing auction starts. Every stop-loss pattern below is valid only up to
+> 3:15 PM for those symbols. After 3:15 the only bound left is the ±3% auction band around the
+> 3:00-3:15 VWAP, and market orders are rejected from 3:25. Flatten before 3:15, or hold the
+> stop **in-process** and convert it into an auction limit order. Derivatives (which now trade
+> to 3:40 PM) and non-CAS cash symbols are unaffected. See `indian-market.md` §1A.
+
 ### Fixed Percentage Stop-Loss
 
 Exit when price moves against entry by fixed %.
@@ -222,46 +230,70 @@ stop = atr_trailing_stop(
 )
 ```
 
-### Time-Based Exit (Market Close Square-Off)
+### Time-Based Exit (Continuous-Session Square-Off)
 
-Always square off positions before market close. Critical for F&O in India (4:00 PM NSE close).
+Always square off intraday positions before the **continuous session** ends. Since the SEBI
+Closing Auction Session went live on 3 Aug 2026 there are three different clocks — pick the
+right one per symbol.
+
+| Segment | Continuous trading | After that |
+|---|---|---|
+| Cash — symbol **has** F&O contracts (CAS scrip) | 09:15-**15:15** | Call auction to a random close 15:28-15:30, matching to 15:35. Close = auction equilibrium price |
+| Cash — no F&O contracts | 09:15-15:30 | Unchanged (VWAP-of-last-30-min close) |
+| Equity/index derivatives | 09:15-**15:40** | Extended by the CAS framework from 15:30 |
+| MCX commodities | 09:00-23:30 | Unchanged |
+
+At 15:15 the exchange cancels every untriggered stop-loss and disclosed-quantity order on a
+CAS scrip, and from 15:25 market-order requests are rejected. Your broker's MIS auto-square-off
+is separate and is policy (~15:00-15:12) — read it, don't assume it.
 
 ```python
-def should_exit_on_time(current_time, market_close_time="15:30",
-                        buffer_minutes=5, is_intraday=True):
+from datetime import datetime, time as dtime, timedelta
+
+# Continuous-session end by segment (IST). See references/indian-market.md §1A.
+CONTINUOUS_END = {
+    'CASH_CAS':     dtime(15, 15),   # cash, symbol has live F&O contracts
+    'CASH_NON_CAS': dtime(15, 30),
+    'DERIVATIVES':  dtime(15, 40),
+}
+
+def should_exit_on_time(current_time, segment='CASH_CAS',
+                        buffer_minutes=10, is_intraday=True):
     """
-    Determine if position should be exited based on time.
+    Should this intraday position be squared off now?
 
     Args:
-        current_time: Current time (str "HH:MM" or datetime)
-        market_close_time: Market close time (str "HH:MM")
-        buffer_minutes: Exit buffer before close (int)
+        current_time: Current time (str "HH:MM" or datetime.time)
+        segment: key of CONTINUOUS_END. Resolve 'CASH_CAS' at runtime from the
+                 instrument master — never from a hardcoded symbol list.
+        buffer_minutes: how early to exit before continuous trading ends. Check your
+                 broker's own MIS auto-square-off time too; it is policy and may be earlier.
         is_intraday: True for intraday, False for overnight
 
     Returns:
-        Boolean: True if should exit
+        (should_exit: bool, reason: str)
     """
-    from datetime import datetime, timedelta
-
+    if not is_intraday:
+        return False, 'Not an intraday position'
     if isinstance(current_time, str):
         current_time = datetime.strptime(current_time, "%H:%M").time()
-    if isinstance(market_close_time, str):
-        market_close_time = datetime.strptime(market_close_time, "%H:%M").time()
 
-    # For intraday F&O: square off by 3:25 PM (NSE close 3:30 PM)
-    exit_time = (datetime.combine(datetime.today(), market_close_time) -
-                 timedelta(minutes=buffer_minutes)).time()
+    end = CONTINUOUS_END[segment]
+    exit_at = (datetime.combine(datetime.today(), end) -
+               timedelta(minutes=buffer_minutes)).time()
 
-    return current_time >= exit_time if is_intraday else False
+    if current_time >= end:
+        if segment == 'CASH_CAS':
+            return True, ('Closing auction: continuous trading closed 15:15, untriggered '
+                          'SL orders already cancelled. Limit orders inside the ±3% band '
+                          'only; market-order requests rejected from 15:25.')
+        return True, 'Past continuous session end'
+    return current_time >= exit_at, f'Square-off buffer reached (continuous ends {end})'
 
-# Example: Exit F&O 5 minutes before 3:30 PM close
-should_exit = should_exit_on_time(
-    current_time="15:25",
-    market_close_time="15:30",
-    buffer_minutes=5,
-    is_intraday=True
-)
-# Returns True: must square off now
+# A — cash CAS scrip at 15:07: exit NOW, the continuous book closes at 15:15
+should_exit_on_time("15:07", segment='CASH_CAS')       # (True, 'Square-off buffer reached…')
+# B — NIFTY futures at 15:07: derivatives run to 15:40, still 33 minutes left
+should_exit_on_time("15:07", segment='DERIVATIVES')    # (False, ...)
 ```
 
 ### Indicator-Based Exit (RSI Reversal)
@@ -796,7 +828,8 @@ class RiskManager:
 3. **Monitor total portfolio heat** — never exceed 6% open risk on capital.
 4. **Respect F&O margin dynamics** — calendar spreads explode 5-10x near expiry; physical delivery adds margin.
 5. **Never sell naked options** — unlimited loss potential. Always hedge or use spreads.
-6. **Always exit before market close** — especially critical for Indian F&O (3:30 PM NSE).
-7. **Use ATR for volatility-adjusted stops** — scale size inversely to volatility.
+6. **Exit before the CONTINUOUS session ends — know which clock your symbol runs on.** Since CAS (3 Aug 2026): cash symbols with F&O contracts stop continuous trading at 3:15 PM, then a call auction runs to a random close at 3:28-3:30 with matching to 3:35. The exchange cancels untriggered stop-loss and disclosed-quantity orders at 3:15 PM and rejects market-order requests from 3:25 PM. Derivatives run to 3:40 PM; non-CAS cash to 3:30 PM.
+7. **A CAS scrip's official close is the auction equilibrium price**, not a 30-minute VWAP — and it can differ between NSE and BSE. Any MTM mark, benchmark or backtest keyed to "the close" must be rechecked.
+8. **Use ATR for volatility-adjusted stops** — scale size inversely to volatility.
 
 Implement the `RiskManager` class in every strategy to enforce these rules automatically.

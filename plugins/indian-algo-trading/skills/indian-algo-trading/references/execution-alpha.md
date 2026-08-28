@@ -116,9 +116,14 @@ volume_profile = {
     '10:30-12:00': 0.15,  # mid-morning
     '12:00-1:30': 0.08,   # lunch trap, low vol
     '1:30-2:30': 0.12,    # post-lunch
-    '2:30-3:20': 0.20,    # closing swing, high vol
-    '3:20-3:30': 0.15     # final sprint
+    '2:30-3:15': 0.20,    # closing swing, high vol
+    'CAS_AUCTION': 0.15   # CAS scrips: single crossing at the random close — NOT sliceable
 }
+# For a CAS scrip (cash symbol with F&O contracts) continuous trading ends 3:15 PM.
+# 'CAS_AUCTION' is not a time slot: route that quantity to ONE auction limit order placed
+# before 3:15, never to the time-slicer. Non-CAS cash keeps a '3:15-3:30' slot; derivatives
+# now run to 3:40 PM. Volume profiles fitted on pre-Aug-2026 data overweight the final
+# 30 minutes with liquidity that has since moved into the auction — refit on recent data.
 
 vwap_plan = vwap_execution_plan(100000, volume_profile)
 for step in vwap_plan[:3]:
@@ -128,6 +133,12 @@ for step in vwap_plan[:3]:
 ## Iceberg Orders: Show Only Visible Fraction
 
 Hide bulk of order to avoid signaling intent to market:
+
+> **CAS warning.** NSE/BSE icebergs are disclosed-quantity orders, and the exchange **cancels
+> all disclosed-quantity orders at 3:15 PM** on CAS scrips — any unfilled hidden residual is
+> cancelled, not carried into the auction. NSE requires `DisclosedVol = 0` on every CAS order.
+> Complete iceberg execution by ~3:10 PM, or convert the residual into an explicit auction
+> limit order before 3:15.
 
 ```python
 def iceberg_order_structure(total_quantity, visible_pct=0.10, price_level=500):
@@ -165,7 +176,10 @@ Exploit time-of-day effects in Nifty/Sensex:
 ```python
 def nse_intraday_seasonality():
     """
-    NSE (IST, UTC+5:30) opens 9:15 AM, closes 3:30 PM.
+    NSE (IST, UTC+5:30) opens 9:15 AM. The close depends on segment since CAS
+    (3 Aug 2026): cash symbols WITH F&O contracts end continuous trading at 3:15 PM
+    then run a call auction to matching at 3:30-3:35; cash without F&O ends 3:30 PM;
+    equity derivatives end 3:40 PM. The buckets below describe CONTINUOUS trading only.
 
     KEY PATTERNS:
     1. Opening Range (9:15-9:45): Highest volatility, gap moves, momentum setup
@@ -173,8 +187,12 @@ def nse_intraday_seasonality():
     3. Mid-Morning (10:30-12:00): Trend continuation, low vol, easy to predict
     4. Lunch Trap (12:00-1:30): Lowest liquidity, whipsaw risk, avoid trend
     5. Post-Lunch (1:30-2:30): Mean reversion, range bound
-    6. Closing Swing (2:30-3:20): High vol, algos front-run: best for options
-    7. Final Sprint (3:20-3:30): Stop hunts, gaps to daily close
+    6. Closing Swing (2:30-3:15): High vol, algos front-run: best for options.
+       Last continuous window for CAS scrips.
+    7a. Closing Auction (3:15 -> random close 3:28-3:30, matching 3:30-3:35), CAS
+        scrips only: call auction, ±3% band, no market-order requests after 3:25,
+        untriggered SL and disclosed-qty orders cancelled at 3:15.
+    7b. Final Sprint (3:20-3:30), non-CAS cash and derivatives: stop hunts, thin book.
     """
     seasonality = {
         '9:15-9:45': {
@@ -212,19 +230,30 @@ def nse_intraday_seasonality():
             'liquidity': 'MODERATE',
             'recommendation': 'RANGE_BOUND, REVERSAL_PLAYS'
         },
-        '2:30-3:20': {
+        '2:30-3:15': {
             'period': 'CLOSING_SWING',
             'volatility': 'VERY_HIGH',
             'strategy': 'OPTIONS_GAMMA_HEDGING',
             'liquidity': 'EXCELLENT',
-            'recommendation': 'BEST_FOR_OPTIONS, GAMMA_SCALP, ALGOS_ACTIVE'
+            'recommendation': 'BEST_FOR_OPTIONS, GAMMA_SCALP, ALGOS_ACTIVE',
+            'note': 'Last continuous window for CAS scrips (cash + F&O contracts)'
         },
-        '3:20-3:30': {
+        '3:15-3:35_CAS': {
+            'period': 'CLOSING_AUCTION',
+            'volatility': 'DISCONTINUOUS',
+            'strategy': 'AUCTION_LIMIT_ONLY',
+            'liquidity': 'CONCENTRATED_SINGLE_PRINT',
+            'recommendation': ('BEST_VENUE_FOR_CLOSE_BENCHMARKED_FLOW; '
+                               'NO_CONTINUOUS_EXECUTION; NO_STOPS_ACTIVE'),
+            'note': 'CAS scrips only. ±3% band, limit-only after 3:25, random close 3:28-3:30'
+        },
+        '3:20-3:30_NON_CAS': {
             'period': 'FINAL_SPRINT',
             'volatility': 'EXTREME',
             'strategy': 'AVOID',
             'liquidity': 'POOR',
-            'recommendation': 'STOP_HUNTS, GAPS_TO_CLOSE, AVOID_NEW_LONGS'
+            'recommendation': 'STOP_HUNTS, GAPS_TO_CLOSE, AVOID_NEW_LONGS',
+            'note': 'Non-CAS cash (to 3:30) and derivatives (to 3:40)'
         }
     }
 
@@ -256,7 +285,7 @@ def select_execution_time(signal_strength, market_regime, target_slippage_bps=5)
         }
     elif market_regime == 'VOLATILE':
         return {
-            'window': '2:30-3:20',  # Closing swing (gamma activity)
+            'window': '2:30-3:15',  # Closing swing (gamma activity); CAS scrips stop here
             'reason': 'Options gamma hedging, high vol beneficial',
             'expected_slippage': 5
         }
@@ -319,22 +348,50 @@ expiry_rules = expiry_day_execution_rules(days_to_expiry=0, order_size=100000, d
 print(expiry_rules)
 ```
 
-## Stop Hunt Avoidance: Final 10 Minutes
+## Closing-Window Risk: auction (CAS scrips) vs stop hunts (everything else)
 
-Final 10 minutes (3:20-3:30 PM) see extreme moves and stop hunts:
+Two different endgames since 3 Aug 2026. For a **CAS scrip** (cash symbol with F&O contracts)
+the continuous book shuts at 3:15 PM and a call auction sets the close. For non-CAS cash and
+for derivatives the old stop-hunt dynamic still applies into 3:30 / 3:40 PM.
 
 ```python
-def avoid_stop_hunt_window():
-    """
-    3:20-3:30 PM (last 10 min): Algos hunt for stops, take liquidity.
-    Action: Close all positions by 3:15 PM.
-    Never hold naked shorts into close (gap risk).
-    """
-    current_time = pd.Timestamp.now().time()
-    market_close = pd.Timestamp('15:30').time()
-    time_to_close = (pd.Timestamp.combine(pd.Timestamp.today(), market_close) -
-                     pd.Timestamp.combine(pd.Timestamp.today(), current_time)).total_seconds() / 60
+from datetime import time as dtime
 
+CAS_CONTINUOUS_END = dtime(15, 15)   # cash, symbol has F&O contracts
+CAS_MKT_ORDER_BAN  = dtime(15, 25)   # market-order requests rejected from here
+CAS_RANDOM_CLOSE   = dtime(15, 28)   # order entry can end any time from here to 15:30
+
+def closing_window_state(now, segment='CASH_CAS', close_time=dtime(15, 30)):
+    """
+    CASH_CAS timeline:
+      <= 15:05     normal continuous trading
+      15:05-15:15  LAST CHANCE — the continuous book closes at 15:15
+      15:15        auction opens; exchange cancels untriggered SL + disclosed-qty orders;
+                   limit and market orders accepted from 15:20
+      15:25        limit orders only; market-order requests rejected
+      15:28-15:30  random close — assume anything live will trade, there is no
+                   pull-at-15:29:59
+    Other segments keep the old stop-hunt logic against their own close
+    (non-CAS cash 15:30, derivatives 15:40).
+    """
+    if segment == 'CASH_CAS':
+        if now >= CAS_RANDOM_CLOSE:
+            return {'alert': 'CAS_CLOSING',
+                    'recommendation': 'NO_ACTION_POSSIBLE — order entry may end any second'}
+        if now >= CAS_MKT_ORDER_BAN:
+            return {'alert': 'CAS_LIMIT_ONLY',
+                    'recommendation': 'LIMIT_ORDERS_ONLY inside ±3% of the reference price'}
+        if now >= CAS_CONTINUOUS_END:
+            return {'alert': 'CAS_AUCTION',
+                    'recommendation': 'AUCTION_ONLY — no continuous book, stops already cancelled'}
+        if now >= dtime(15, 5):
+            return {'alert': 'CAS_LAST_CHANCE',
+                    'recommendation': 'CLOSE_ALL_OPEN_POSITIONS before 15:15'}
+        return {'alert': 'NORMAL_TRADING', 'recommendation': 'PROCEED_WITH_EXECUTION'}
+
+    # non-CAS cash and derivatives — original stop-hunt logic
+    time_to_close = (pd.Timestamp.combine(pd.Timestamp.today(), close_time) -
+                     pd.Timestamp.combine(pd.Timestamp.today(), now)).total_seconds() / 60
     if time_to_close < 10:
         return {
             'alert': 'STOP_HUNT_WINDOW_ACTIVE',
@@ -348,14 +405,10 @@ def avoid_stop_hunt_window():
             'recommendation': 'REDUCE_SIZE_BY_50%',
             'time_to_close_minutes': time_to_close
         }
-    else:
-        return {
-            'alert': 'NORMAL_TRADING',
-            'recommendation': 'PROCEED_WITH_EXECUTION'
-        }
+    return {'alert': 'NORMAL_TRADING', 'recommendation': 'PROCEED_WITH_EXECUTION'}
 
 # During final 10 min
-stop_hunt_alert = avoid_stop_hunt_window()
+stop_hunt_alert = closing_window_state(pd.Timestamp.now().time(), segment='CASH_CAS')
 if 'HUNT' in stop_hunt_alert['alert']:
     print(f"ALERT: {stop_hunt_alert['alert']} - {stop_hunt_alert['recommendation']}")
 ```
@@ -374,9 +427,9 @@ def execute_order_with_seasonality_awareness(
     Integrated execution orchestration combining TWAP, VWAP, seasonality, impact.
     """
     # 1. Check if in stop-hunt window
-    stop_hunt_status = avoid_stop_hunt_window()
-    if 'HUNT' in stop_hunt_status['alert']:
-        return {'status': 'REJECTED', 'reason': 'In stop-hunt window'}
+    stop_hunt_status = closing_window_state(pd.Timestamp.now().time(), segment=segment)
+    if stop_hunt_status['alert'] not in ('NORMAL_TRADING',):
+        return {'status': 'REJECTED', 'reason': stop_hunt_status['alert']}
 
     # 2. Estimate impact
     impact_bps = estimate_impact_cost(
@@ -427,7 +480,8 @@ print(f"  Expected Entry: {plan['expected_entry']:.2f}")
 - **Iceberg**: Hide 90%, show 10% to avoid signaling intent
 - **Power Hour (9:45-10:30)**: Best for momentum. Execute here for strong signals
 - **Lunch Trap (12:00-1:30)**: Avoid trends. Low vol, whipsaw, unpredictable
-- **Closing Swing (2:30-3:20)**: Highest vol, best for gamma scalping & options
-- **Final Sprint (3:20-3:30)**: Stop hunts, gaps. Close ALL by 3:15 PM
+- **Closing Swing (2:30-3:15)**: Highest vol, best for gamma scalping & options. Last continuous window for CAS scrips
+- **Closing Auction (3:15-3:35, CAS scrips)**: Call auction sets the close. Limit-only after 3:25, ±3% band, random close 3:28-3:30. Stops already cancelled at 3:15
+- **Final Sprint (3:20-3:30, non-CAS cash; to 3:40 derivatives)**: Stop hunts, gaps. Close ALL well before
 - **Expiry Day**: Extreme gamma. Close by 3:00 PM, avoid new longs after 2:30 PM
 - **Combine**: Select window by regime, execute TWAP over target period, monitor impact cost

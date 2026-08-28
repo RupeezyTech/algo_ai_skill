@@ -105,8 +105,21 @@ class StrategyValidator(ast.NodeVisitor):
         """Check string content for specific patterns."""
         source = ast.unparse(tree)
 
-        if 'pytz' in source or 'timezone' in source.lower() or 'utc' in source.lower():
+        # A real IST setup, not just the word "utc" appearing somewhere. The old check
+        # accepted `datetime.utcnow()` — precisely the bug Critical Rule 7 warns about.
+        if ('pytz' in source or 'ZoneInfo' in source
+                or 'Asia/Kolkata' in source or 'astimezone' in source):
             self.has_timezone = True
+
+        # Naive clocks return UTC on the container; they are off by 5h30m from IST.
+        for bad in ('datetime.utcnow()', 'datetime.now()', 'date.today()'):
+            if bad in source:
+                self.issues['NAIVE_DATETIME'].append({
+                    'line': 0,
+                    'msg': (f'Found {bad} — returns UTC (or naive local), not IST. '
+                            f'Use datetime.now(IST) with IST = pytz.timezone("Asia/Kolkata"). '
+                            f'See Critical Rule 7.')
+                })
 
         if 'stop' in source.lower() and 'loss' in source.lower():
             self.has_stop_loss = True
@@ -144,7 +157,8 @@ def validate_file(filepath):
     checks = {
         'HARDCODED_TOKEN': ('FAIL', validator.issues.get('HARDCODED_TOKEN', [])),
         'PRINT_STATEMENT': ('WARN', validator.issues.get('PRINT_STATEMENT', [])),
-        'TIMEZONE': ('WARN', [] if validator.has_timezone else ['No timezone configuration found']),
+        'TIMEZONE': ('WARN', [] if validator.has_timezone else ['No IST timezone configuration found (Rule 7)']),
+        'NAIVE_DATETIME': ('WARN', validator.issues.get('NAIVE_DATETIME', [])),
         'STOP_LOSS': ('WARN', [] if validator.has_stop_loss else ['No stop-loss logic detected']),
         'ERROR_HANDLING': ('WARN', [] if validator.has_error_handling_orders else ['Missing try/except around place_order']),
         'LOGGING': ('WARN', [] if validator.has_logging else ['No logging import found']),

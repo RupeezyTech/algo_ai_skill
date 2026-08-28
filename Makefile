@@ -10,8 +10,7 @@ PLUGIN_FILE := $(BUILD_DIR)/$(SKILL_NAME)-$(VERSION).plugin
 SKILL_FILES := $(SKILL_DIR)/SKILL.md \
 	$(wildcard $(SKILL_DIR)/references/*.md) \
 	$(wildcard $(SKILL_DIR)/references/brokers/*.md) \
-	$(SKILL_DIR)/scripts/validate_strategy.py \
-	$(SKILL_DIR)/scripts/scaffold_strategy.py
+	$(wildcard $(SKILL_DIR)/scripts/*.py)
 
 # Plugin manifest + MCP (lives under plugins/indian-algo-trading/)
 # marketplace.json stays in repo (for GitHub marketplace sync) but NOT in .plugin zip
@@ -48,11 +47,15 @@ $(PLUGIN_FILE): $(SKILL_FILES) $(PLUGIN_EXTRA)
 	@rm -rf $(BUILD_DIR)/plugin-staging
 	@mkdir -p $(BUILD_DIR)/plugin-staging/.claude-plugin
 	@mkdir -p $(BUILD_DIR)/plugin-staging/skills/$(SKILL_NAME)/references/brokers
+	@mkdir -p $(BUILD_DIR)/plugin-staging/skills/$(SKILL_NAME)/scripts
 	# Copy SKILL.md
 	cp $(SKILL_DIR)/SKILL.md $(BUILD_DIR)/plugin-staging/skills/$(SKILL_NAME)/
 	# Copy references (preserve brokers/ subdirectory so SKILL.md paths work)
 	cp $(SKILL_DIR)/references/*.md $(BUILD_DIR)/plugin-staging/skills/$(SKILL_NAME)/references/
 	cp $(SKILL_DIR)/references/brokers/*.md $(BUILD_DIR)/plugin-staging/skills/$(SKILL_NAME)/references/brokers/
+	# Copy scripts — SKILL.md and CONTRIBUTING_BROKER.md instruct running these by path,
+	# so they must ship in the plugin package too, not just the .skill package
+	cp $(SKILL_DIR)/scripts/*.py $(BUILD_DIR)/plugin-staging/skills/$(SKILL_NAME)/scripts/
 	# Copy plugin manifest + MCP
 	cp $(PLUGIN_DIR)/.claude-plugin/plugin.json $(BUILD_DIR)/plugin-staging/.claude-plugin/
 	cp $(PLUGIN_DIR)/.mcp.json $(BUILD_DIR)/plugin-staging/

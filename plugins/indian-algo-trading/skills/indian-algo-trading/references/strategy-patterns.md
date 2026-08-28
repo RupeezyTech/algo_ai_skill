@@ -29,7 +29,7 @@ This document teaches AI assistants to recognize, design, and code trading strat
 - Place tight stop-losses (1-2% below entry for long)
 - Exit if trend weakens (MA flattens or crossover reverses)
 - Avoid during economic news releases on India earnings days
-- Size positions smaller in choppy 10-4 PM sessions
+- Size positions smaller in choppy afternoon sessions (roughly 12:00-3:00 PM)
 
 **Python Skeleton — SMA Crossover:**
 ```python
@@ -178,7 +178,7 @@ class IronCondor(Strategy):
 - Major news catalyst breaks VWAP (RBI rate decision)
 - Strong trend ignores VWAP (trades 3-5% above/below)
 - Low liquidity stocks where VWAP is unreliable
-- End of day (3:15-3:30 PM) when institutional flow dominates
+- After 3:15 PM on CAS scrips — continuous trading has ended and the closing auction has begun, so there is no continuous tape to compute or fade VWAP against. (On derivatives and non-CAS cash, the old caution holds: 3:15-3:30 institutional flow overwhelms VWAP mean reversion.)
 
 **Key Parameters:**
 - VWAP band: +/- 0.5-1.5% envelope
@@ -188,7 +188,7 @@ class IronCondor(Strategy):
 
 **Risk Warnings:**
 - VWAP resets at market open (9:15 AM IST)
-- Use only during regular hours (9:15 AM - 3:30 PM IST)
+- Run only during continuous trading, and know which clock your symbol uses: cash with F&O contracts 9:15 AM-3:15 PM; non-CAS cash to 3:30 PM; derivatives to 3:40 PM
 - Avoid trading first 30 minutes (high uncertainty)
 - Don't fade VWAP in strong trending sessions
 
@@ -385,7 +385,7 @@ class PairsTrading(Strategy):
 ## General Risk Management Rules
 
 1. **Position Sizing:** Risk no more than 2% of account per trade
-2. **Stop-Loss Discipline:** Always use hard stops; never move against position
+2. **Stop-Loss Discipline:** Always use hard stops; never move against position. On CAS scrips the exchange cancels untriggered stop-loss orders at 3:15 PM — a resting stop gives no protection from 3:15 to the close
 3. **Profit Targets:** Exit 50-75% at target; let winners run with trailing stops
 4. **Slippage Buffer:** Add 0.05-0.1% to expected entry/exit prices
 5. **Liquidity Check:** Trade only symbols with >100k daily volume
@@ -396,10 +396,21 @@ class PairsTrading(Strategy):
 ---
 
 ## IST Market Hours
-- Regular: 9:15 AM - 3:30 PM IST
-- Pre-open: 9:00-9:15 AM (order entry, no execution)
-- Post-close: 3:40-4:00 PM (institutional clearing only)
+- Pre-open: 9:00-9:15 AM (order entry + opening call auction, no continuous execution).
+  **Restructured from 7 Sep 2026** to mirror CAS: limit+market 9:00-9:05; limit only 9:05-9:10
+  with a random close between 9:08 and 9:10; matching 9:10-9:12; transition to CTS 9:12-9:15.
+  Any hardcoded 9:08 cutoff is wrong from that date. See `indian-market.md` §1B.
+- Continuous trading, by segment (since CAS, 3 Aug 2026):
+  - Cash, symbol **has** F&O contracts ("CAS scrip"): 9:15 AM - **3:15 PM**
+  - Cash, no F&O contracts: 9:15 AM - 3:30 PM
+  - Equity/index derivatives: 9:15 AM - **3:40 PM** (extended from 3:30)
+- Closing Auction Session (CAS scrips only): 3:15-3:35 PM. No order entry 3:15-3:20;
+  limit+market 3:20-3:25; limit only to a random close 3:28-3:30; matching 3:30-3:35.
+  Closing price = auction equilibrium price, replacing the old last-30-min VWAP.
+- Post-close: 3:50-4:00 PM (moved from 3:40, for all securities)
 - Holidays: Check NSE/BSE calendar before deploying strategies
+
+See `indian-market.md` §1A for the full CAS rules.
 
 ---
 

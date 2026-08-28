@@ -21,21 +21,37 @@ version: 1.1.14
 
 Write production-quality Python trading strategies for Indian markets. Every strategy must be safe enough to run with real money.
 
+## Who You Are Talking To
+
+The user is a **trader, not a programmer**. Assume they cannot read Python, cannot review your code for correctness, and cannot debug an error message. You are the only reviewer this code will ever have — every safeguard is your responsibility, not theirs.
+
+- **Ask questions they can answer.** Trading vocabulary (strike, stop-loss, lot, expiry, intraday) is fine. Software vocabulary (container, env var, dependency, SDK, token, deployment) is not.
+- **Never block on a question they can't answer.** Pick a safe default, state it in one line, move on.
+- **Explain in plain English before and after** — confirm the strategy before coding (Step 2), explain what you built after (Strategy Output Format).
+- **Walk them through anything they must do themselves.** Give one command per line and say what a good result looks like. Never say "set an environment variable" — say "open the file called `.env` and put your key after the `=`", and prefer writing the file for them.
+- **Money in rupees, never bare percentages**, in anything the user reads.
+
 ## Before Writing Any Code
 
 ### Step 1: Understand the User's Intent
 
 Ask (skip any already answered):
 
-1. **Asset class** — equity, F&O, currency, commodities?
+1. **Asset class** — equity, F&O, currency, commodities? If cash equity: are any symbols F&O-eligible? Those are CAS scrips — continuous trading ends 3:15 PM and their exit deadline differs (Rule 16).
 2. **Live or backtest?**
 3. **Broker** — Rupeezy/Vortex (default; see `references/brokers/rupeezy-vortex.md`) or other (check `references/brokers/`)?
-4. **Deployment** — self-hosted (user runs `python main.py` themselves; MUST ship `login.py`+`auth.py`, see Rule 8) or Rupeezy container (zip uploaded via MCP; zero-arg `VortexAPI()`, no login files)?
-5. **Risk tolerance** — max loss per trade / day / drawdown. Defaults if unknown: 1% / 3% / 10%.
+4. **Where should it run?** Ask this in plain words — do **not** say "self-hosted", "container", "deployment" or "MCP" to the user:
+   > "Two choices: **(a) Rupeezy runs it for you** — you install nothing and it keeps trading even when your laptop is off. **(b) You run it yourself** — it lives on your own computer or a rented server, and only trades while that machine is on and the program is running."
+
+   If the user is unsure, says "whichever is easier", or has no server → pick **(a)**, say so in one line, and move on. Never stall here.
+   Internal mapping: (a) = Rupeezy container — zero-arg `VortexAPI()`, no login files. (b) = self-hosted — MUST ship `login.py`+`auth.py` (Rule 8).
+5. **Risk tolerance** — ask in rupees, not percent: "How much are you OK losing on one bad trade, and what's the most you'd accept losing in a single day before the bot stops?" If they answer in percent or don't know, ask for total capital and convert. Defaults if unknown: 1% of capital per trade / 3% per day / 10% max drawdown — and **always state them back in rupees**.
 
 ### Step 2: Discuss Strategy Design
 
-Before any code: entry logic, exit logic (stop-loss is mandatory), position sizing, scheduling, hedging (warn against naked options selling).
+Before any code, agree on: entry logic; exit logic (stop-loss is mandatory — and on a CAS scrip it cannot be a resting exchange-side SL after 3:15 PM, Rule 16); position sizing; scheduling (agree the intraday exit deadline explicitly — before 3:15 PM for cash CAS scrips, 3:20-3:25 for non-CAS cash and F&O); hedging (warn against naked options selling; note a cash/F&O hedge cannot be rebalanced 3:15-3:40).
+
+Then **confirm before coding.** Write the strategy back as a numbered list of plain-English rules plus one worked example with real rupee numbers on their stated capital. Ask "Is that exactly what you want it to do?" and wait. If they correct anything, restate the whole list rather than patching it verbally.
 
 ### Step 3: Route to the Right References
 
@@ -46,10 +62,12 @@ Load only what's relevant. Core references — read when topic comes up:
 | New strategy | `references/strategy-patterns.md` |
 | Risk / position sizing | `references/risk-management.md` |
 | Backtesting | `references/backtesting.md` |
-| Indian market rules (expiry, timings, margins) | `references/indian-market.md` |
+| Indian market rules (expiry, timings, closing auction/CAS, square-off, margins) | `references/indian-market.md` |
 | Error handling | `references/error-handling.md` |
 | Code quality / testing | `references/code-quality.md` |
 | Rupeezy/Vortex SDK | `references/brokers/rupeezy-vortex.md` |
+
+Load `indian-market.md` unconditionally for any strategy that trades cash equity intraday — the closing-auction timings (Rule 16) are not something to infer.
 
 Advanced (suggest proactively when context fits): `options-greeks.md`, `regime-detection.md`, `india-data-edge.md`, `execution-alpha.md`, `robustness-testing.md`, `portfolio-construction.md`, `psychological-guardrails.md`, `tax-optimization.md`, `python-performance.md`. Don't wait for the user to ask — for MA crossover suggest regime detection; for 40% CAGR backtest demand robustness testing.
 
@@ -98,13 +116,15 @@ Use `logging`, not `print()`. Log every decision with timestamp, symbol, action,
 
 Handle SIGTERM/SIGINT: cancel pending orders, optionally square off, log final state. Critical for container deployments where the platform can stop the strategy any time.
 
+The square-off path must be session-aware: for cash equity in a CAS scrip after 3:15 PM there is no continuous book and a market order will fail (and is rejected outright after 3:25). Either route a LIMIT order into the auction inside the ±3% band, or log loudly that the position is carrying to settlement. Never let the handler report success on an unfilled square-off.
+
 ---
 
 ## Critical Rules — Violations Cause Real Money Loss
 
 These are non-negotiable. Every strategy must follow them.
 
-> **⚠ Silent-until-live failure modes: Rules 1, 11, 12, 13, 15.** These pass `py_compile`, `pytest`, and often a WebSocket smoke test — they blow up only on the first real broker interaction (or on a later trading day when something rolls). Walk these five explicitly whenever you scaffold or modify a strategy. Each rule's body names the specific failure.
+> **⚠ Silent-until-live failure modes: Rules 1, 11, 12, 13, 15, 16.** These pass `py_compile`, `pytest`, and often a WebSocket smoke test — they blow up only on the first real broker interaction, on a later trading day when something rolls, or at 3:15 PM when the closing auction starts (Rule 16). Walk these six explicitly whenever you scaffold or modify a strategy. Each rule's body names the specific failure.
 
 ### 1. NEVER hardcode instrument tokens
 
@@ -125,6 +145,8 @@ Lot sizes change with corporate actions and SEBI directives. Read them off the i
 
 Every strategy ships with one. If the user explicitly refuses, warn and add a wide-buffer stop anyway; document the risk.
 
+**CAS caveat:** on a CAS scrip the exchange cancels untriggered stop-loss and disclosed-quantity orders at 3:15 PM (Rule 16). A resting broker-side SL is not protection through the close. Either flatten before 3:15 PM, or hold the stop **in-process** and, if it fires after 3:15, send a LIMIT order into the auction inside the ±3% band.
+
 ### 4. ALWAYS check margin before placing orders
 
 Call `get_order_margin()` first. If insufficient, log and skip — don't crash.
@@ -139,11 +161,16 @@ A "buy 100" can fill 60 now + 40 later, or 60 then cancel. Track fill state prec
 
 ### 7. ALWAYS set IST timezone explicitly
 
+**The strategy container runs in UTC.** `datetime.now()` / `utcnow()` and other naive clocks return UTC, not IST — so without an explicit timezone every market-hours and scheduling check is off by 5h30m. Make every time value timezone-aware in IST.
+
 ```python
-import pytz; IST = pytz.timezone("Asia/Kolkata")
+import pytz
+from datetime import datetime
+IST = pytz.timezone("Asia/Kolkata")
+now = datetime.now(IST)   # timezone-aware IST — NOT datetime.now() / utcnow()
 ```
 
-Never rely on system timezone.
+Never rely on the system timezone (it is UTC) or on naive datetimes.
 
 ### 8. Self-hosted strategies MUST ship `login.py` + `auth.py`
 
@@ -171,9 +198,11 @@ Terminal-status detection is **substring-based** to catch broker-decorated forms
 
 The reference `OrderTracker` in `references/code-quality.md` (and the scaffolded `order_tracker.py`) implements all of this — wire it, don't re-implement.
 
+**CAS mass-cancel:** at 3:15 PM the exchange cancels every untriggered SL and disclosed-quantity order on CAS scrips, one message per order, producing a burst of exchange-initiated `CANCELLED` postbacks. `on_order_terminal` must not read these as the user withdrawing protection, and must never infer a position was closed from an SL cancellation.
+
 ### 10. NEVER short sell illiquid equities intraday
 
-Auction risk: stock hits upper circuit → you can't exit → 20%+ penalty above your sell price. Check volume + circuit band before shorting; prefer F&O for shorts. Details in `references/indian-market.md`.
+**Settlement-auction** risk (a different mechanism from the Closing Auction Session in Rule 16): stock hits upper circuit → you can't exit → 20%+ penalty above your sell price. Check volume + circuit band before shorting; prefer F&O for shorts. A cash short in a CAS scrip must additionally be flat before 3:15 PM — after that there is no continuous book and the resting stop-loss has been cancelled. Details in `references/indian-market.md`.
 
 ### 11. ALWAYS respect tick sizes
 
@@ -186,6 +215,8 @@ def round_to_tick(price, tick): return round(round(price / tick) * tick, 2)
 ### 12. ALWAYS respect Daily Price Range (DPR)
 
 Exchanges set a daily circuit-limit band per instrument. Orders outside it are rejected by the broker's OMS before reaching the exchange — common cause of failed deep stop-losses and ambitious targets. Read DPR from the broker's quote/market data and clamp `price` / `trigger_price` accordingly.
+
+On a CAS scrip during the closing auction a second, tighter band applies: ±3% of the auction reference price (VWAP of 3:00-3:15 PM). Clamp to `min(DPR, CAS band)` for any auction-routed order, and compute the reference price yourself from 3:00 PM ticks if the broker doesn't publish it. See Rule 16 and `references/indian-market.md` §1A/§11.
 
 ### 13. Account for calendar spread margin removal on expiry day
 
@@ -211,6 +242,28 @@ client.place_order(product=Vc.ProductTypes.INTRADAY, ...)
 
 If you store these in `config.py`, store the enum directly (the scaffolded `config.py` does). Name ≠ value for many `Vc.*` enums (`Vc.VarietyTypes.REGULAR_LIMIT_ORDER.value == "RL"`, `Vc.ExchangeTypes.NSE_EQUITY.value == "NSE_EQ"`), so a stringly-typed config with `getattr(Vc.X, name)` lookup also works but only if you store the **member name**, not the value.
 
+### 16. Cash-equity intraday exits must clear the Closing Auction Session
+
+Since 3 Aug 2026, a cash-segment stock **with live derivative contracts** (a "CAS scrip") stops continuous trading at **3:15 PM**, not 3:30, and its close is set by a call auction: 3:15-3:20 no order entry at all, 3:20-3:25 limit + market, 3:25 to a random close between 3:28 and 3:30 limit only, matching 3:30-3:35, post-close 3:50-4:00. Equity derivatives run to 3:40 PM — CAS is cash-segment only, and does not touch F&O, currency or MCX.
+
+What this breaks in code:
+
+- **Exit deadline** is before 3:15 PM, not 3:25. Square-off is the broker's RMS on the broker's own schedule (policy, ~3:00-3:12 PM across brokers) — read it, never assume it.
+- **Untriggered stop-loss and disclosed-quantity orders are cancelled by the exchange at 3:15 PM.** A resting broker-side SL is not protection through the close (see Rule 3).
+- **Price band** in the auction is ±3% of the 3:00-3:15 VWAP reference price — tighter than DPR. Clamp to the narrower of the two (Rule 12). Limit orders only after 3:25.
+- **"The close" changed meaning** — it is the auction equilibrium price, and it differs between NSE and BSE for the same stock.
+- **No candles exist for a CAS scrip between 3:15 and 3:30 PM** — not empty bars, none at all. So `df.iloc[-1]` at 3:22 returns the 3:14 bar and your "current price" is silently stale; "wait for the next bar" loops never fire; fixed bar-count lookbacks shift meaning. Drive closing-window logic off `datetime.now(IST)`, never off bar arrival.
+- **Resolve the CAS scrip list at runtime** from the instrument master. Never hardcode.
+
+```python
+# Vortex has no documented CAS flag — derive it from the F&O master
+is_cas_scrip = bool(client.instruments.all_by_underlying("NSE_FO", "RELIANCE"))
+```
+
+**The pre-open is realigned to the same shape on 7 Sep 2026**: limit+market 9:00-9:05, limit only 9:05-9:10 with a random close between 9:08 and 9:10, matching 9:10-9:12, transition 9:12-9:15. Any hardcoded 9:08 pre-open cutoff is wrong from that date. Branch on the date — don't just swap the constants.
+
+Full timeline, order-type table, carry-forward rules and broker-layer caveats: `references/indian-market.md` §1A (closing auction) and §1B (pre-open). Vortex-specific CAS behaviour is not documented in any circular — verify against Rupeezy's developer notes before going live.
+
 ---
 
 ## Backtesting Standards
@@ -219,6 +272,8 @@ Every backtest must include realistic friction. Zero-cost backtests produce fant
 
 - **Costs**: STT (eq 0.1%, fut 0.05%, opt 0.1%) + brokerage + exchange. `commission=0.001` minimum in backtesting.py (raise for options). Rates in `references/indian-market.md`.
 - **Slippage**: ≥0.05% liquid, 0.1-0.2% illiquid; double near F&O expiry.
+- **CAS structural break (3 Aug 2026)**: for CAS scrips the daily close switched from a last-30-minutes VWAP to the auction equilibrium price. Any series spanning that date has a regime break in its Close column — flag it, don't fit close-anchored signals across it, and rebuild intraday volume profiles from post-CAS data only.
+- **Intraday exit fills**: model the last continuous fill at 3:15 PM for CAS scrips, not 3:25/3:29. A backtest that exits "at the close" is assuming an auction fill at the equilibrium price — state and stress that assumption.
 
 If CAGR > 30%, flag and require robustness testing (walk-forward, Monte Carlo, OOS). If parameters are tunable, run grid optimization with heatmap. See `references/robustness-testing.md`.
 
@@ -234,6 +289,29 @@ If CAGR > 30%, flag and require robustness testing (walk-forward, Monte Carlo, O
 
 Backtest-only strategies can be a single file as long as risk management, realistic costs, and parameters are present. If a backtest touches `VortexAPI`, the self-hosted layout applies.
 
+### Mandatory gate before handover
+
+The user cannot review this code — you are the only reviewer. Before handing anything over:
+
+```bash
+python scripts/validate_strategy.py <strategy_dir>/
+```
+
+Run it on the **whole directory**. Interpret the output yourself; never paste it at the user. Exit 2 (hardcoded token/lot size, NSE scraping) is blocking — fix and re-run. Exit 1 warnings are per-file substring heuristics, so a warning on `strategy.py` (no order code) or `config.py` (no timezone) is expected — confirm each is a false positive against the actual file before dismissing it. The validator does **not** cover the silent-until-live rules (1, 11, 12, 13, 15, 16); hand-check those yourself.
+
+If the script isn't reachable from the install, replicate its checks by hand rather than skipping the gate.
+
+### Explaining the result
+
+The README is the only artifact this user can read. After generating any strategy:
+
+1. **Restate what it does** in 5-8 numbered plain-English lines — no code, no library names.
+2. **State the money numbers**: risk per trade, daily stop, and worst observed drawdown, in rupees on their actual capital.
+3. **Say what it will not do** — the failure modes it doesn't handle, and what happens if the machine or container stops.
+4. **Give the exact run and stop instructions**, one command per line, with expected output.
+
+If CAGR > 30%, say so plainly and unprompted before the user gets excited: numbers that good usually mean the settings were fitted to past data. Then run robustness testing and report the outcome in the same plain terms — read the heatmap yourself rather than handing it over.
+
 ---
 
 ## Proactive Suggestions
@@ -244,5 +322,5 @@ After generating a strategy, offer the relevant ones:
 - **Robustness testing** (walk-forward, Monte Carlo) when going live or when CAGR > 30%.
 - **Psychological guardrails** (daily loss caps, consecutive-loss pause) on any live strategy.
 - **Tax optimization** when holding-period tweaks could move trades from STCG (20%) to LTCG (12.5%).
-- **VWAP execution** for orders > 5% of ADV.
+- **VWAP execution** for orders > 5% of ADV. On CAS scrips the schedule must end by 3:15 PM — compress the profile into 9:15-3:15 and route any residual as one deliberate auction limit order. Pre-Aug-2026 volume profiles overweight the final 30 minutes with liquidity that has moved into the auction.
 - **Vectorization** when you see Python loops over price data.

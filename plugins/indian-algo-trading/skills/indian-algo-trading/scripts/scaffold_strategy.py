@@ -173,12 +173,9 @@ def main():
     signal.signal(signal.SIGTERM, handle_sigterm)
 
     try:
-        if ''' + ('"backtest"' if strategy_type == 'backtest' else '"live"') + ''' in ''' + strategy_type.upper() + ''':
-            logger.info("Running backtest mode")
-            strategy.backtest()
-        else:
-            logger.info("Running live mode")
-            strategy.run()
+''' + ('        logger.info("Running backtest mode")\n        strategy.backtest()'
+       if strategy_type == 'backtest' else
+       '        logger.info("Running live mode")\n        strategy.run()') + '''
 
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt received")
@@ -312,14 +309,20 @@ class Strategy:
         pass
 ''' + terminal_method + '''
     def backtest(self):
-        """Run strategy in backtest mode (paper trading)."""
-        logger.info("Backtest mode not yet implemented")
+        """Run strategy in backtest mode."""
         # TODO: Load historical data and run signal generation
+        raise NotImplementedError(
+            "strategy.backtest() is still the scaffold stub - no backtest logic has "
+            "been written yet. Implement it before running this strategy."
+        )
 
     def run(self):
         """Run strategy in live mode."""
-        logger.info("Live mode not yet implemented")
         # TODO: Connect to WebSocket, listen to ticks, place orders
+        raise NotImplementedError(
+            "strategy.run() is still the scaffold stub - no trading logic has been "
+            "written yet. Implement it before starting this strategy."
+        )
 '''
     (base_dir / 'strategy.py').write_text(content)
     logger.info("Created strategy.py")
@@ -522,7 +525,21 @@ class Config:
     # Market parameters
     exchange: str = "NSE"
     market_open_time: str = "09:15"  # IST
-    market_close_time: str = "15:30"  # IST
+
+    # Continuous-session end differs by segment since the SEBI Closing Auction Session
+    # went live on 3 Aug 2026 (see SKILL.md Rule 16):
+    #   cash symbol WITH live F&O contracts ("CAS scrip") -> 15:15, then a call auction
+    #   cash symbol without F&O contracts                 -> 15:30
+    #   equity derivatives                                -> 15:40
+    # Resolve which one applies at runtime from the instrument master - never hardcode
+    # a symbol list. On Vortex:
+    #   is_cas = bool(client.instruments.all_by_underlying("NSE_FO", underlying))
+    continuous_end_cash_cas: str = "15:15"      # IST
+    continuous_end_cash_non_cas: str = "15:30"  # IST
+    continuous_end_derivatives: str = "15:40"   # IST
+    # Your own flat-by deadline, ahead of the applicable continuous end. Your broker's
+    # MIS auto-square-off is separate and is broker policy (~15:00-15:12) - check it.
+    intraday_exit_buffer_minutes: int = 10
 
     # Order parameters — Vc.* ENUM INSTANCES, not strings (see module docstring).
     # Pass these directly to client.place_order / client.get_order_margin.

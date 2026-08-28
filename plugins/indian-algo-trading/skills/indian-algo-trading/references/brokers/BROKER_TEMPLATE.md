@@ -351,4 +351,4 @@ Document any gaps or gotchas with this broker:
 
 **Contributor Notes:**
 
-Complete all sections above. Add code examples that are copy-paste ready. Test your adapter against the validation script (`validate_strategy.py`) before submitting.
+Complete all sections above. Add code examples that are copy-paste ready. Validate this document against `scripts/validate_broker_adapter.py` before submitting (`validate_strategy.py` is the linter for generated strategy code, not for broker adapter docs).

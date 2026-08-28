@@ -94,6 +94,32 @@ Plan your backtest period based on instrument type:
 
 **For expired futures/options:** Use spot data as a proxy. Adjust volatility expectations, as options carry time decay that spot contracts do not.
 
+### Closing Auction Session (CAS) discontinuities — from 3 August 2026
+
+Two separate breaks affect any cash-equity series for a symbol with F&O contracts (a "CAS
+scrip"). Both are silent: nothing raises, the data just changes shape.
+
+**1. Intraday bars stop at 3:15 PM.** There are **no candles at all** between 3:15 and 3:30 PM
+— no continuous matching means no trade prints to build them from. A CAS scrip yields roughly
+360 one-minute bars per day instead of 375. Consequences for backtests:
+
+- Any loop or lookback keyed to bar *count* rather than timestamp changes meaning across
+  3 Aug 2026, and differs between CAS and non-CAS symbols on the same day.
+- A backtest that exits "on the last bar of the day" now exits at 3:15 PM, not 3:29 — which
+  happens to be correct, but only by accident. Make the deadline explicit.
+- Never `ffill()` across the gap: it fabricates 15 minutes of prices that never traded.
+- When aligning a multi-symbol panel, join on **timestamp, never on position** — CAS and
+  non-CAS symbols have different bar counts for the same session.
+
+**2. The daily close changed methodology.** Before 3 Aug 2026 it was the VWAP of the last 30
+minutes; after, it is the auction equilibrium price. Any close-anchored series spanning that
+date has a **regime break** in it — don't fit close-to-close signals across the boundary, and
+rebuild intraday volume profiles from post-CAS data only (pre-CAS profiles overweight the final
+30 minutes with liquidity that has since moved into the auction).
+
+Split the sample at 3 Aug 2026 and check both halves separately before trusting a result that
+spans it. See `indian-market.md` §1A.
+
 ---
 
 ## 3. Realistic Transaction Costs (CRITICAL)

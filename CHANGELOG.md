@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-08-28
+
+### Added
+
+- **Critical Rule 16 — "Cash-equity intraday exits must clear the Closing Auction Session."** SEBI's CAS framework went live in the cash segment on 3 August 2026 for securities with live derivative contracts. For those symbols continuous trading now ends at **3:15 PM**, not 3:30, and the closing price is set by a call auction: no order entry 3:15-3:20, limit + market 3:20-3:25, limit only from 3:25 to a system-driven random close between 3:28 and 3:30, matching 3:30-3:35, post-close moved to 3:50-4:00. The equity derivatives segment was **extended to 3:40 PM**. The skill had no awareness of any of this and would generate strategies that place exit orders into a book that no longer exists.
+- **`references/indian-market.md` §1A "Closing Auction Session (CAS)"** — full phase timeline, the ±3% static reference-price band (VWAP of 3:00-3:15, a 15-minute window), order-type eligibility table, carry-forward and time-priority rules, equilibrium-price and matching-priority logic, per-exchange divergence, suspension cases, and an explicit broker-layer section. Sourced only to SEBI circular `SEBI/HO/47/11/11(3)2025-MRD-POD2/I/2765/2026` (16 Jan 2026), `NSE/CMTR/73362` (18 Mar 2026), NSE CAS FAQ v1.0 (May 2026) and BSE Notice 20260610-41 (10 Jun 2026) — several broker and news explainers published the wrong session length after go-live.
+- Runtime CAS-eligibility derivation for Vortex (`client.instruments.all_by_underlying("NSE_FO", underlying)`), since the SDK exposes no CAS flag and the eligible list moves with SEBI's F&O reviews.
+- **"Bar gaps on CAS scrips" (`indian-market.md` §1A) and CAS discontinuities in `backtesting.md`.** There are **no candles at all** for a CAS scrip between 3:15 and 3:30 PM — not empty bars, none — because no continuous matching occurs. Every consequence is a silent failure: `df.iloc[-1]` at 3:22 PM returns the 3:14 bar so "current price" is stale, "wait for the next bar" loops never fire, fixed bar-count lookbacks shift meaning, daily gap-detection alerts fire falsely, and `ffill()` fabricates prices that never traded. A CAS scrip yields ~360 one-minute bars a day against 375 for a non-CAS symbol, so multi-symbol panels must join on timestamp rather than position. The guidance is to drive all closing-window logic off `datetime.now(IST)`, never off bar arrival.
+- **"Who You Are Talking To" section in `SKILL.md`** — states the reader's user is a trader, not a programmer, and derives the consequences (answerable questions, safe defaults instead of blocking, rupees not bare percentages, walk-throughs for anything the user must do themselves).
+- **Mandatory pre-handover validation gate** — `scripts/validate_strategy.py` shipped since 1.0 and was referenced from nowhere in `SKILL.md`. It is now a required step in Strategy Output Format, with guidance on interpreting its per-file heuristics and a note that it does not cover the silent-until-live rules.
+- **"Explaining the result" section** — what the README and the post-generation explanation must contain, since the README is the only artifact a non-programmer can read.
+
+### Changed
+
+- **Market hours are now segment-split everywhere.** `indian-market.md` (timings table, F&O bullet, segments table, DPR section, short-selling section, launch checklist, footer), `risk-management.md` (`should_exit_on_time` rewritten to take a `segment`, stop-loss section warning, key takeaways), `execution-alpha.md` (seasonality buckets, VWAP volume profile, iceberg warning, closing-window state machine), `strategy-patterns.md` (VWAP operating hours, IST market-hours block, stop-loss discipline).
+- **Rules 3, 9, 10 and 12 gained CAS caveats.** Untriggered stop-loss and disclosed-quantity orders are cancelled by the exchange at 3:15 PM on CAS scrips, so a resting broker-side SL is not protection through the close (Rule 3) and the resulting burst of exchange-initiated `CANCELLED` postbacks must not be read as user cancellations (Rule 9). The auction's ±3% band is tighter than DPR and binds any auction-routed order (Rule 12).
+- Rule 16 added to the silent-until-live list (now Rules 1, 11, 12, 13, 15, 16).
+- Step 1 question 4 (deployment) rewritten in plain language with a default, so a non-programmer can answer it; question 5 (risk) now asks in rupees. Step 2 now requires confirming the strategy back to the user in plain English before writing code.
+- Scaffolded `config.py`: the unused `market_close_time = "15:30"` replaced by `continuous_end_cash_cas` / `continuous_end_cash_non_cas` / `continuous_end_derivatives` plus `intraday_exit_buffer_minutes`.
+- Graceful Shutdown now requires a session-aware square-off path that cannot report success on an unfilled exit.
+
+### Fixed
+
+- **Generated `main.py` crashed with `NameError` on every scaffold.** The template emitted `if "live" in LIVE:` — `LIVE` is a bare undefined name, produced by interpolating `strategy_type.upper()` into the generated source. **The branches were also inverted**: the `live` path called `strategy.backtest()` and vice versa. Replaced with a literal branch resolved at scaffold time. It passed `py_compile`, so `make test-scaffold` (which only checks that files exist) never caught it.
+- **Scaffolded `Strategy.run()` / `.backtest()` exited silently.** Both stubs logged "not yet implemented" and returned, so `python main.py` completed with exit code 0 on a strategy that had no logic — indistinguishable from a working run for a non-programmer. They now raise `NotImplementedError` naming the fix.
+- **The `.plugin` package shipped no `scripts/` directory at all.** `SKILL.md` instructs Claude to run `scripts/scaffold_strategy.py` (Rule 8) and `scripts/validate_strategy.py` (the new handover gate), and `CONTRIBUTING_BROKER.md` points at `scripts/validate_broker_adapter.py` — none of which existed for anyone who installed via the marketplace plugin, only for `.skill` installs. The Makefile's `plugin` target now stages `scripts/*.py`, and `SKILL_FILES` uses a wildcard so a newly added script can't silently fall out of both packages again.
+- `BROKER_TEMPLATE.md` told broker contributors to validate their adapter with `validate_strategy.py` — the AST linter for generated strategy code, which cannot check a markdown adapter doc. Corrected to `scripts/validate_broker_adapter.py`.
+- **`validate_strategy.py`'s timezone check passed on the exact bug Rule 7 warns about.** The condition was `'utc' in source.lower()`, so a strategy calling `datetime.utcnow()` — naive UTC, 5h30m off IST — satisfied the TIMEZONE check. It now looks for a real IST setup (`pytz` / `ZoneInfo` / `Asia/Kolkata` / `astimezone`) and adds a `NAIVE_DATETIME` check that flags `datetime.utcnow()`, `datetime.now()` and `date.today()` by name.
+- `indian-market.md` claimed intraday positions are "forcibly closed by the exchange" at 3:29:59. Square-off is the broker's RMS on its own schedule; published cutoffs range from about 3:00 to 3:12 PM for CAS scrips and are policy, not regulation. Now documented as broker-specific and never to be hardcoded.
+- `risk-management.md` stated a "4:00 PM NSE close". NSE continuous trading has never ended at 4:00 PM.
+- `strategy-patterns.md` referred to "choppy 10-4 PM sessions" — no such session exists.
+- Post-close session corrected from 3:40-4:00 to 3:50-4:00 (it moved for CAS and non-CAS securities alike).
+
+### Notes
+
+- The **Pre-Open Auction Session realignment is effective 7 September 2026** and is not yet in force. Documented in full as `indian-market.md` §1B: limit+market 9:00-9:05; limit only 9:05-9:10 with a system-driven random close in the last 2 minutes (9:08-9:10); matching 9:10-9:12; transition to CTS 9:12-9:15. It applies to the whole cash segment, not just CAS scrips, and it retires the 9:08 AM order-entry cutoff. Code touching pre-open must branch on the date; a backtest spanning the changeover needs both structures.
+- Rupeezy/Vortex-specific CAS behaviour (order acceptance during 3:15-3:20, square-off timing, GTT triggers, rejection codes) is not covered by any circular and must be confirmed against Rupeezy's developer notes before live use.
+- The auction print's exact timestamp, and whether the daily `close` field from a given historical API carries the equilibrium price, still vary by vendor — confirm against your own data source.
+- Conflicts left deliberately hedged: NSE says IOC is not allowed in CAS while BSE's guidelines describe IOC orders inside CAS; the ±3% stock-futures band is NSE-sourced, not SEBI-sourced; the circuit-breaker CAS suspension and the "Buffer Period" label are BSE-only; the 3:10-3:40 derivatives closing VWAP comes from the NSE FAQ citing a circular that could not be retrieved.
+- CHANGELOG gap: entries for 1.1.11 through 1.1.14 were never written; this entry follows 1.1.10.
+
 ## [1.1.10] - 2026-05-26
 
 ### Added
