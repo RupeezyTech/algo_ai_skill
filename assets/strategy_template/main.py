@@ -15,13 +15,31 @@ from typing import Optional
 import pytz
 
 from config import Config
-from strategy import Strategy
+from strategy import Strategy, Tick
 from risk_manager import RiskManager
 from guardrails import CircuitBreaker
 
 
 # Configure IST timezone
 IST = pytz.timezone("Asia/Kolkata")
+
+
+class ExampleStrategy(Strategy):
+    """
+    Minimal example subclass of the abstract Strategy class.
+
+    Strategy.next() is an abstractmethod, so Strategy itself cannot be
+    instantiated directly. This class exists only to make the runner
+    executable out of the box.
+
+    TODO: Implement your own signal generation logic in next() below
+    (e.g., moving average crossover, mean reversion, momentum) and call
+    self.place_order(...) when your entry/exit conditions are met.
+    """
+
+    def next(self, tick: Tick) -> None:
+        # TODO: Replace this no-op with your strategy's signal logic.
+        pass
 
 # Configure logging with IST timestamps
 class ISTFormatter(logging.Formatter):
@@ -130,7 +148,10 @@ class StrategyRunner:
             self.logger.info("Risk manager and circuit breaker initialized.")
 
             # Initialize strategy
-            self.strategy = Strategy(self.config, risk_manager, circuit_breaker)
+            # NOTE: Strategy is an ABC and cannot be instantiated directly.
+            # ExampleStrategy is a placeholder subclass — replace it with your
+            # own Strategy subclass once you've implemented next().
+            self.strategy = ExampleStrategy(self.config, risk_manager, circuit_breaker)
             self.logger.info("Strategy initialized.")
 
             # Run strategy

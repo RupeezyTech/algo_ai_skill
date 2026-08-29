@@ -60,17 +60,17 @@ def circuit_breaker(config: Config) -> CircuitBreaker:
 @pytest.fixture
 def strategy(
     config: Config, risk_manager: RiskManager, circuit_breaker: CircuitBreaker
-) -> "TestStrategy":
+) -> "StubStrategy":
     """Provide a concrete strategy implementation for testing."""
-    return TestStrategy(config, risk_manager, circuit_breaker)
+    return StubStrategy(config, risk_manager, circuit_breaker)
 
 
 # ============================================================================
-# Test Strategy Implementation (for testing)
+# Stub Strategy Implementation (for testing)
 # ============================================================================
 
 
-class TestStrategy(Strategy):
+class StubStrategy(Strategy):
     """Concrete strategy implementation for unit testing."""
 
     def next(self, tick: Tick) -> None:
@@ -341,6 +341,40 @@ class TestPnlTracking:
 
         assert risk_manager.get_daily_pnl() == 4000.0
 
+    def test_update_pnl_oversell_clamps_to_zero_and_resets_avg_price(
+        self, config: Config, risk_manager: RiskManager
+    ):
+        """Test that selling more than the open long clamps quantity at 0.
+
+        Realized P&L must only be computed on the portion that actually closes
+        the long (min(quantity, position.quantity)); the oversold remainder
+        must not push quantity negative or corrupt avg_entry_price.
+        """
+        # Buy 10 at 2500
+        risk_manager.update_pnl("RELIANCE", "BUY", 10, 2500.0)
+
+        # Sell 15 at 2600: only 10 close the long (profit: 10 * 100 = 1000),
+        # the remaining 5 are oversold and must be ignored, not go short.
+        risk_manager.update_pnl("RELIANCE", "SELL", 15, 2600.0)
+
+        position = risk_manager.get_position("RELIANCE")
+        assert position.quantity == 0
+        assert position.avg_entry_price == 0.0
+        assert position.realized_pnl == 1000.0
+        assert risk_manager.daily_realized_pnl == 1000.0
+
+    def test_update_pnl_oversell_on_flat_position_ignored(
+        self, config: Config, risk_manager: RiskManager
+    ):
+        """Test that selling with no open position is fully ignored (no short)."""
+        risk_manager.update_pnl("RELIANCE", "SELL", 10, 2600.0)
+
+        position = risk_manager.get_position("RELIANCE")
+        assert position.quantity == 0
+        assert position.avg_entry_price == 0.0
+        assert position.realized_pnl == 0.0
+        assert risk_manager.daily_realized_pnl == 0.0
+
 
 # ============================================================================
 # Tests: Strategy Order Placement
@@ -351,7 +385,7 @@ class TestStrategyOrderPlacement:
     """Tests for strategy order placement and approval."""
 
     def test_place_normal_order(
-        self, strategy: TestStrategy, risk_manager: RiskManager
+        self, strategy: StubStrategy, risk_manager: RiskManager
     ):
         """Test placing a normal order through strategy."""
         order_id = strategy.place_order(
@@ -366,7 +400,7 @@ class TestStrategyOrderPlacement:
         assert strategy.orders[order_id].status == "PENDING"
 
     def test_place_rejected_order(
-        self, strategy: TestStrategy, risk_manager: RiskManager
+        self, strategy: StubStrategy, risk_manager: RiskManager
     ):
         """Test that rejected orders are not added to strategy."""
         # Set daily loss to trigger rejection
@@ -382,7 +416,7 @@ class TestStrategyOrderPlacement:
         assert order_id is None
 
     def test_place_oversized_order(
-        self, strategy: TestStrategy, risk_manager: RiskManager
+        self, strategy: StubStrategy, risk_manager: RiskManager
     ):
         """Test that oversized orders are rejected."""
         order_id = strategy.place_order(
@@ -441,7 +475,7 @@ class TestConfigValidation:
 class TestOrderLifecycle:
     """Tests for order state transitions."""
 
-    def test_order_fill_update(self, strategy: TestStrategy):
+    def test_order_fill_update(self, strategy: StubStrategy):
         """Test order state update on fill."""
         order_id = strategy.place_order(
             symbol="RELIANCE",
@@ -457,7 +491,7 @@ class TestOrderLifecycle:
         assert order.filled_quantity == 10
         assert order.filled_price == 2500.0
 
-    def test_order_partial_fill_update(self, strategy: TestStrategy):
+    def test_order_partial_fill_update(self, strategy: StubStrategy):
         """Test order state update on partial fill."""
         order_id = strategy.place_order(
             symbol="RELIANCE",
@@ -477,7 +511,7 @@ class TestOrderLifecycle:
         assert order.status == "FILLED"
         assert order.filled_quantity == 10
 
-    def test_order_cancel(self, strategy: TestStrategy):
+    def test_order_cancel(self, strategy: StubStrategy):
         """Test order cancellation."""
         order_id = strategy.place_order(
             symbol="RELIANCE",
@@ -490,3 +524,68 @@ class TestOrderLifecycle:
 
         order = strategy.orders[order_id]
         assert order.status == "CANCELLED"
+
+    def test_order_partial_fill_weighted_average_price(self, strategy: StubStrategy):
+        """Test that partial fills at different prices report a quantity-weighted
+        average filled_price, not just the last fill's price.
+
+        60 @ 100 + 40 @ 110 -> (60*100 + 40*110) / 100 = 104.0
+        """
+        order_id = strategy.place_order(
+            symbol="RELIANCE",
+            transaction_type="BUY",
+            quantity=100,
+            price=105.0,
+        )
+
+        strategy.on_order_fill(order_id, filled_quantity=60, filled_price=100.0)
+        order = strategy.orders[order_id]
+        assert order.status == "PARTIALLY_FILLED"
+        assert order.filled_quantity == 60
+        assert order.filled_price == 100.0
+
+        strategy.on_order_fill(order_id, filled_quantity=40, filled_price=110.0)
+        assert order.status == "FILLED"
+        assert order.filled_quantity == 100
+        assert order.filled_price == pytest.approx(104.0)
+
+
+# ============================================================================
+# Tests: main.py runnability (BUG-A)
+# ============================================================================
+
+
+class TestMainExampleStrategy:
+    """Tests that main.py provides a concrete, instantiable Strategy subclass.
+
+    Strategy is an ABC (next() is an abstractmethod), so StrategyRunner.run()
+    must not instantiate Strategy directly. main.py imports cleanly with no
+    broker credentials required, so the class is constructed directly here.
+    """
+
+    def test_example_strategy_instantiates(
+        self, config: Config, risk_manager: RiskManager, circuit_breaker: CircuitBreaker
+    ):
+        from main import ExampleStrategy
+
+        instance = ExampleStrategy(config, risk_manager, circuit_breaker)
+        assert isinstance(instance, Strategy)
+
+    def test_example_strategy_next_is_a_noop(
+        self, config: Config, risk_manager: RiskManager, circuit_breaker: CircuitBreaker
+    ):
+        from main import ExampleStrategy
+
+        instance = ExampleStrategy(config, risk_manager, circuit_breaker)
+        tick = Tick(
+            timestamp=datetime.now(tz=IST),
+            symbol="RELIANCE",
+            open_price=100.0,
+            high_price=101.0,
+            low_price=99.0,
+            close_price=100.5,
+            volume=1000,
+        )
+        # Should not raise and should not place any orders (documented no-op).
+        instance.next(tick)
+        assert instance.orders == {}

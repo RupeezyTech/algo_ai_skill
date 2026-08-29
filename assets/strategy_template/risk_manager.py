@@ -161,14 +161,26 @@ class RiskManager:
             if position.quantity > 0:
                 position.avg_entry_price = total_cost / position.quantity
         else:  # SELL
-            # Calculate realized P&L on sale
-            if position.quantity > 0:
+            # Calculate realized P&L only on the portion that closes the existing long.
+            closing_quantity = min(quantity, position.quantity) if position.quantity > 0 else 0
+            if closing_quantity > 0:
                 pnl_per_unit = price - position.avg_entry_price
-                realized_pnl = pnl_per_unit * min(quantity, position.quantity)
+                realized_pnl = pnl_per_unit * closing_quantity
                 self.daily_realized_pnl += realized_pnl
                 position.realized_pnl += realized_pnl
 
-            position.quantity -= quantity
+            # This template is long-only: clamp at 0 instead of going short on
+            # an oversell, which would otherwise leave a phantom short position
+            # carrying the old long's avg_entry_price.
+            oversold_quantity = quantity - closing_quantity
+            if oversold_quantity > 0:
+                self.logger.warning(
+                    f"Oversold {symbol}: sell quantity {quantity} exceeds long "
+                    f"position of {position.quantity}; {oversold_quantity} unit(s) "
+                    f"ignored (long-only, no short positions supported)."
+                )
+
+            position.quantity = max(position.quantity - quantity, 0)
             if position.quantity == 0:
                 position.avg_entry_price = 0.0
 
